@@ -180,7 +180,7 @@ PostgreSQL's `unnest()` can be used directly in SELECT, but Doris requires LATER
 ```python
 sql = "SELECT id, unnest(string_to_array(tags, ',')) AS tag FROM t"
 result = pg_to_doris(sql)[0]
-# Output: SELECT id, tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _tmp AS tag
+# Output: SELECT id, _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag
 ```
 
 **Conversion Rules:**
@@ -250,7 +250,7 @@ Output:
 CREATE TEMPORARY TABLE result AS
 SELECT
   id,
-  tag
+  _explode_tmp.tag
 FROM articles
 LATERAL VIEW
 EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag

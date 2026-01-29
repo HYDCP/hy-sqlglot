@@ -568,7 +568,7 @@ Available Modes:
 
 EXPLODE/UNNEST Conversion:
   - PostgreSQL: SELECT unnest(arr) AS x FROM t
-  - Doris:      SELECT x FROM t LATERAL VIEW EXPLODE(arr) tmp AS x
+  - Doris:      SELECT tmp.x FROM t LATERAL VIEW EXPLODE(arr) tmp AS x
 """)
 
 

@@ -16,7 +16,7 @@ Usage:
     # Method 3: Handle UNNEST/EXPLODE auto-conversion to LATERAL VIEW
     from sqlglot.contrib.doris_transpile import pg_to_doris
     result = pg_to_doris("SELECT id, unnest(string_to_array(tags, ',')) AS tag FROM t")
-    # => ['SELECT id, tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag']
+    # => ['SELECT id, _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag']
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def explode_to_lateral_view(expression: exp.Expression) -> exp.Expression:
         SELECT id, unnest(string_to_array(tags, ',')) AS tag FROM t
 
     After (Doris):
-        SELECT id, tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag
+        SELECT id, _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(SPLIT_BY_STRING(tags, ',')) _explode_tmp AS tag
 
     Args:
         expression: The AST to process
@@ -125,9 +125,10 @@ def _transform_select_explode(select: exp.Select) -> None:
             )
             laterals_to_add.append(lateral)
 
-            # Replace EXPLODE with column reference in SELECT
+            # Replace EXPLODE with column reference in SELECT (include table alias)
             new_expressions.append(exp.Column(
-                this=exp.to_identifier(alias_name)))
+                this=exp.to_identifier(alias_name),
+                table=exp.to_identifier(table_alias_name)))
         else:
             new_expressions.append(expr)
 
@@ -332,7 +333,7 @@ def transpile_to_doris(
             - CAST(id AS int) AS x -> unchanged (already has alias)
             - CAST(id + 1 AS int) -> unchanged (not a simple column)
         explode_to_lateral: Whether to convert EXPLODE/UNNEST in SELECT to LATERAL VIEW (default True)
-            - SELECT unnest(arr) AS x -> SELECT x FROM ... LATERAL VIEW EXPLODE(arr) tmp AS x
+            - SELECT unnest(arr) AS x -> SELECT tmp.x FROM ... LATERAL VIEW EXPLODE(arr) tmp AS x
             - Doris doesn't support EXPLODE directly in SELECT, must use LATERAL VIEW
         **opts: Other Generator options (e.g., pretty=True)
 
@@ -355,7 +356,7 @@ def transpile_to_doris(
         >>> # UNNEST auto-converted to LATERAL VIEW
         >>> sql = "SELECT id, unnest(string_to_array(tags, ',')) AS tag FROM t"
         >>> transpile_to_doris(sql, read="postgres")
-        ['SELECT id, tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
+        ['SELECT id, _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
     """
     write = (read if write is None else write) if identity else write
     write_dialect = Dialect.get_or_raise(write)
@@ -404,7 +405,7 @@ def pg_to_doris(
         >>> pg_to_doris("SELECT CAST(id AS int) FROM t")
         ['SELECT CAST(id AS INT) AS id FROM t']
         >>> pg_to_doris("SELECT unnest(string_to_array(tags, ',')) AS tag FROM t")
-        ['SELECT tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
+        ['SELECT _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
     """
     return transpile_to_doris(
         sql,
