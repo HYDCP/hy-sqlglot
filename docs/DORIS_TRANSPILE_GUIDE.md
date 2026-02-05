@@ -6,11 +6,14 @@
 
 ### Problems Solved
 
-| Problem                          | Original transpile           | transpile_to_doris          |
-| -------------------------------- | ---------------------------- | --------------------------- |
-| Identifier case sensitivity diff | ❌ `T.id` and `t.id` mismatch | ✅ Auto-unify to lowercase   |
-| CAST without alias loses colname | ❌ `__cast_0`                 | ✅ Auto-add column alias     |
-| UNNEST/EXPLODE syntax difference | ❌ Doris doesn't support      | ✅ Auto-convert LATERAL VIEW |
+| Problem                             | Original transpile           | transpile_to_doris           |
+| ----------------------------------- | ---------------------------- | ---------------------------- |
+| Identifier case sensitivity diff    | ❌ `T.id` and `t.id` mismatch | ✅ Auto-unify to lowercase    |
+| CAST without alias loses colname    | ❌ `__cast_0`                 | ✅ Auto-add column alias      |
+| UNNEST/EXPLODE syntax difference    | ❌ Doris doesn't support      | ✅ Auto-convert LATERAL VIEW  |
+| REGEXP_SPLIT_TO_TABLE not supported | ❌ Doris doesn't support      | ✅ Auto-convert LATERAL VIEW  |
+| WITH DATA / WITH NO DATA clause     | ❌ Doris doesn't support      | ✅ Auto-remove clause         |
+| LATERAL VIEW column ambiguity       | ❌ Runtime error in Doris     | ✅ Auto-fix with table prefix |
 
 ---
 
@@ -19,7 +22,7 @@
 ### Installation
 
 ```bash
-pip install sqlglot-26.9.1.dev1-py3-none-any.whl
+pip install sqlglot-26.9.3-py3-none-any.whl
 ```
 
 ### Replace Existing Code
@@ -56,11 +59,12 @@ def transpile_to_doris(
     sql: str,
     read: str = None,              # Source dialect: "postgres", "spark", "hive", "mysql", etc.
     write: str = "doris",          # Target dialect, defaults to doris
-    normalize_mode: str = "table_full",  # Identifier normalization mode
-    auto_alias_cast: bool = True,  # Auto-add alias for CAST
-    explode_to_lateral: bool = True,  # EXPLODE to LATERAL VIEW
-    pretty: bool = False,          # Format output
-    **opts,                        # Other Generator options
+    normalize_mode: str = "table_full",     # Identifier normalization mode
+    auto_alias_cast: bool = True,           # Auto-add alias for CAST
+    explode_to_lateral: bool = True,        # EXPLODE to LATERAL VIEW
+    regexp_split_to_lateral: bool = True,   # REGEXP_SPLIT_TO_TABLE to LATERAL VIEW
+    pretty: bool = False,                   # Format output
+    **opts,                                 # Other Generator options
 ) -> List[str]:
 ```
 
@@ -194,6 +198,114 @@ result = pg_to_doris(sql)[0]
 # Disable this feature
 result = pg_to_doris(sql, explode_to_lateral=False)[0]
 ```
+
+### 4. REGEXP_SPLIT_TO_TABLE to LATERAL VIEW
+
+PostgreSQL's `REGEXP_SPLIT_TO_TABLE()` can be used directly in SELECT to split strings into rows. Doris requires LATERAL VIEW with `SPLIT_BY_REGEXP()`.
+
+```python
+sql = "SELECT id, REGEXP_SPLIT_TO_TABLE(col, ',') AS val FROM t"
+result = pg_to_doris(sql)[0]
+# Output: SELECT id, _explode_tmp.val FROM t LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) _explode_tmp AS val
+```
+
+**Conversion Rules:**
+
+| PostgreSQL                            | Doris                                                 |
+| ------------------------------------- | ----------------------------------------------------- |
+| `REGEXP_SPLIT_TO_TABLE(str, pattern)` | `LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(str, pattern))` |
+
+**Nested REGEXP_SPLIT_TO_TABLE:**
+
+The function supports nested calls, converting each layer to a separate LATERAL VIEW:
+
+```python
+sql = "SELECT REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(col, '、'), '，') AS val FROM t"
+result = pg_to_doris(sql)[0]
+# Output: 
+# SELECT _explode_tmp_2.val FROM t 
+# LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, '、')) _explode_tmp_1 AS _nested_col_0 
+# LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(_explode_tmp_1._nested_col_0, '，')) _explode_tmp_2 AS val
+```
+
+**Real-world Example:**
+
+```python
+sql = """SELECT xxx, xxxx, 
+  REGEXP_SPLIT_TO_TABLE(
+    REGEXP_SPLIT_TO_TABLE(
+      REGEXP_REPLACE(interview, '[0-9]', '', 'g'), 
+      '、'
+    ), 
+    '，'
+  ) AS interview 
+FROM some_table"""
+
+result = pg_to_doris(sql)[0]
+# Output:
+# SELECT xxx, xxxx, _explode_tmp_2.interview 
+# FROM some_table 
+# LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(REGEXP_REPLACE(interview, '[0-9]', '', 'g'), '、')) 
+#   _explode_tmp_1 AS _nested_col_0 
+# LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(_explode_tmp_1._nested_col_0, '，')) 
+#   _explode_tmp_2 AS interview
+```
+
+```python
+# Disable this feature
+result = pg_to_doris(sql, regexp_split_to_lateral=False)[0]
+```
+
+### 5. Remove WITH DATA / WITH NO DATA Clause
+
+PostgreSQL's `CREATE TABLE AS SELECT ... WITH DATA` is not supported in Doris. The clause is automatically removed.
+
+```python
+sql = "CREATE TABLE t1 AS SELECT * FROM source WITH DATA"
+result = pg_to_doris(sql)[0]
+# Output: CREATE TABLE t1 AS SELECT * FROM source
+```
+
+**Conversion Rules:**
+
+| PostgreSQL                                  | Doris                          |
+| ------------------------------------------- | ------------------------------ |
+| `CREATE TABLE t AS SELECT ... WITH DATA`    | `CREATE TABLE t AS SELECT ...` |
+| `CREATE TABLE t AS SELECT ... WITH NO DATA` | `CREATE TABLE t AS SELECT ...` |
+
+This feature is **always enabled** and cannot be disabled, as the clause causes syntax errors in Doris.
+
+### 6. Automatic Column Ambiguity Fix
+
+After converting `REGEXP_SPLIT_TO_TABLE` or `UNNEST` to `LATERAL VIEW`, column name conflicts may occur in `WHERE` clauses. This feature automatically adds table prefixes to resolve ambiguity.
+
+**Problem Scenario:**
+
+```sql
+-- After LATERAL VIEW conversion
+SELECT ... FROM cost_features_table
+LATERAL VIEW EXPLODE(...) tmp AS interview  ← Generates new column 'interview'
+WHERE COALESCE(interview, '') ...  ← Ambiguous! Which 'interview'?
+```
+
+**Automatic Fix:**
+
+```python
+sql = """
+SELECT cust_name, REGEXP_SPLIT_TO_TABLE(interview, ',') AS interview
+FROM cost_features_table
+WHERE NOT COALESCE(interview, '') LIKE '%:%:%'
+"""
+result = pg_to_doris(sql)[0]
+# Output:
+# SELECT cust_name, _explode_tmp.interview
+# FROM cost_features_table
+# LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(interview, ',')) _explode_tmp AS interview
+# WHERE NOT COALESCE(cost_features_table.interview, '') LIKE '%:%:%'
+#                    ↑ Automatically prefixed with table name
+```
+
+This feature is **always enabled** and cannot be disabled, as it prevents runtime errors in Doris.
 
 ---
 
@@ -347,11 +459,14 @@ result = transpile(sql, read="postgres", write="doris")
 
 `transpile_to_doris` signature is compatible with `sqlglot.transpile`, new parameters have defaults:
 
-| Parameter            | Default        | Description                    |
-| -------------------- | -------------- | ------------------------------ |
-| `normalize_mode`     | `"table_full"` | Normalize table + alias + refs |
-| `auto_alias_cast`    | `True`         | Auto-add CAST alias            |
-| `explode_to_lateral` | `True`         | EXPLODE to LATERAL VIEW        |
+| Parameter                 | Default        | Description                              |
+| ------------------------- | -------------- | ---------------------------------------- |
+| `normalize_mode`          | `"table_full"` | Normalize table + alias + refs           |
+| `auto_alias_cast`         | `True`         | Auto-add CAST alias                      |
+| `explode_to_lateral`      | `True`         | EXPLODE to LATERAL VIEW                  |
+| `regexp_split_to_lateral` | `True`         | REGEXP_SPLIT_TO_TABLE to LATERAL VIEW    |
+| `remove_with_data`        | Always enabled | Remove WITH DATA clause (cannot disable) |
+| `fix_ambiguity`           | Always enabled | Fix column ambiguity (cannot disable)    |
 
 ### Disable Enhanced Features
 
@@ -363,7 +478,8 @@ result = transpile_to_doris(
     read="postgres",
     normalize_mode="none",
     auto_alias_cast=False,
-    explode_to_lateral=False
+    explode_to_lateral=False,
+    regexp_split_to_lateral=False
 )
 ```
 
@@ -371,6 +487,7 @@ result = transpile_to_doris(
 
 ## Version Info
 
-- **Package Version**: `sqlglot-26.9.1.dev1`
+- **Package Version**: `sqlglot-26.9.3`
 - **Python Requirement**: `>= 3.7`
 - **Based on**: SQLGlot v26.9.0
+- **Features**: 6 automatic conversions for PostgreSQL to Doris migration

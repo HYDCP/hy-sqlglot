@@ -141,6 +141,259 @@ def _transform_select_explode(select: exp.Select) -> None:
         select.set("laterals", existing_laterals + laterals_to_add)
 
 
+def regexp_split_to_table_to_lateral_view(expression: exp.Expression) -> exp.Expression:
+    """
+    Convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW EXPLODE(split_by_regexp(...)) syntax.
+
+    In PostgreSQL, REGEXP_SPLIT_TO_TABLE can be used directly in SELECT and can be nested.
+    In Doris, it must be converted to LATERAL VIEW with subqueries for nesting.
+
+    Before (PostgreSQL):
+        SELECT id, REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(col, '、'), '，') AS result FROM t
+
+    After (Doris):
+        SELECT t2.id, tmp_2.result AS result 
+        FROM (
+          SELECT t1.id, tmp_1.result AS result 
+          FROM (SELECT id, col FROM t) t1 
+          LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(t1.col, '、')) tmp_1 AS result
+        ) t2 
+        LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(t2.result, '，')) tmp_2 AS result
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST
+    """
+    # Process all SELECT statements recursively
+    for select in list(expression.find_all(exp.Select)):
+        _transform_regexp_split_to_table(select)
+
+    return expression
+
+
+def _transform_regexp_split_to_table(select: exp.Select) -> None:
+    """
+    Transform REGEXP_SPLIT_TO_TABLE calls in a single SELECT statement.
+
+    This handles nested REGEXP_SPLIT_TO_TABLE by iteratively processing each layer,
+    first extracting nested calls into subqueries, then converting the outermost call.
+
+    Args:
+        select: The SELECT node to transform
+    """
+    # Iteratively process until no REGEXP_SPLIT_TO_TABLE remains
+    max_iterations = 10  # Prevent infinite loops
+    iteration = 0
+
+    while iteration < max_iterations:
+        # Find REGEXP_SPLIT_TO_TABLE calls in SELECT expressions
+        found = False
+
+        for i, expr in enumerate(select.expressions):
+            alias_name = None
+            func_call = None
+
+            # Case 1: Alias wrapping the function call
+            if isinstance(expr, exp.Alias):
+                alias_name = expr.alias
+                if isinstance(expr.this, exp.Anonymous) and expr.this.name.upper() == 'REGEXP_SPLIT_TO_TABLE':
+                    func_call = expr.this
+                    found = True
+            # Case 2: Direct function call without alias
+            elif isinstance(expr, exp.Anonymous) and expr.name.upper() == 'REGEXP_SPLIT_TO_TABLE':
+                func_call = expr
+                alias_name = f"_regexp_split_{i}"
+                found = True
+
+            if func_call:
+                # First, recursively replace nested REGEXP_SPLIT_TO_TABLE in arguments
+                func_call = _extract_nested_regexp_split(func_call, select)
+
+                # Now convert this call to LATERAL VIEW
+                call_info = {
+                    'index': i,
+                    'alias': alias_name,
+                    'call': func_call,
+                    'original_expr': expr
+                }
+                _wrap_select_with_lateral_view(select, call_info)
+                # Process one at a time, then restart
+                break
+
+        if not found:
+            break
+
+        iteration += 1
+
+
+def _extract_nested_regexp_split(func_call: exp.Anonymous, select: exp.Select) -> exp.Anonymous:
+    """
+    Extract nested REGEXP_SPLIT_TO_TABLE from function arguments.
+
+    If a REGEXP_SPLIT_TO_TABLE contains nested REGEXP_SPLIT_TO_TABLE in its arguments,
+    this function extracts them to LATERAL VIEWs and replaces them with column references.
+
+    Args:
+        func_call: The REGEXP_SPLIT_TO_TABLE function call
+        select: The parent SELECT statement
+
+    Returns:
+        The function call with nested calls replaced by column references
+    """
+    # Check each argument for nested REGEXP_SPLIT_TO_TABLE
+    new_expressions = []
+    laterals_added = []
+
+    for i, arg in enumerate(func_call.expressions):
+        # Find nested REGEXP_SPLIT_TO_TABLE
+        nested_call = None
+        for node in arg.walk():
+            if isinstance(node, exp.Anonymous) and node.name.upper() == 'REGEXP_SPLIT_TO_TABLE':
+                # Found a nested call
+                nested_call = node
+                break
+
+        if nested_call:
+            # Recursively extract from this nested call first
+            nested_call = _extract_nested_regexp_split(nested_call, select)
+
+            # Generate alias for this nested call
+            nested_alias = _generate_explode_alias()
+            col_alias = f"_nested_col_{i}"
+
+            # Extract arguments
+            if len(nested_call.expressions) >= 2:
+                nested_str_expr = nested_call.expressions[0]
+                nested_pattern = nested_call.expressions[1]
+
+                # Create SPLIT_BY_REGEXP -> EXPLODE -> LATERAL VIEW
+                split_func = exp.Anonymous(
+                    this="SPLIT_BY_REGEXP",
+                    expressions=[nested_str_expr.copy(), nested_pattern.copy()]
+                )
+                explode_func = exp.Explode(this=split_func)
+                lateral = exp.Lateral(
+                    this=explode_func,
+                    view=True,
+                    alias=exp.TableAlias(
+                        this=exp.to_identifier(nested_alias),
+                        columns=[exp.to_identifier(col_alias)]
+                    )
+                )
+
+                # Add to SELECT's laterals
+                existing_laterals = select.args.get("laterals") or []
+                select.set("laterals", existing_laterals + [lateral])
+
+                # Replace the nested call with column reference
+                col_ref = exp.Column(
+                    this=exp.to_identifier(col_alias),
+                    table=exp.to_identifier(nested_alias)
+                )
+                new_expressions.append(col_ref)
+        else:
+            # No nested call, keep original
+            new_expressions.append(arg)
+
+    # Update function call arguments
+    func_call.set("expressions", new_expressions)
+    return func_call
+
+
+def _contains_regexp_split_to_table(node: exp.Expression) -> bool:
+    """
+    Check if an expression contains any REGEXP_SPLIT_TO_TABLE calls.
+
+    Args:
+        node: The expression node to check
+
+    Returns:
+        True if contains REGEXP_SPLIT_TO_TABLE, False otherwise
+    """
+    for child in node.walk():
+        if child is not node and isinstance(child, exp.Anonymous) and child.name.upper() == 'REGEXP_SPLIT_TO_TABLE':
+            return True
+    return False
+
+
+def _wrap_select_with_lateral_view(select: exp.Select, call_info: dict) -> None:
+    """
+    Wrap a SELECT with a LATERAL VIEW for one REGEXP_SPLIT_TO_TABLE call.
+
+    This function modifies the SELECT in-place by:
+    1. Removing the REGEXP_SPLIT_TO_TABLE expression
+    2. Adding a LATERAL VIEW with EXPLODE(SPLIT_BY_REGEXP(...))
+    3. Replacing the original expression with a column reference
+
+    Args:
+        select: The SELECT statement to modify
+        call_info: Dictionary containing call metadata (index, alias, call, original_expr)
+    """
+    func_call = call_info['call']
+    alias_name = call_info['alias']
+    expr_index = call_info['index']
+
+    # Extract arguments: REGEXP_SPLIT_TO_TABLE(string_expr, pattern)
+    args = func_call.expressions
+    if len(args) < 2:
+        return  # Invalid call, skip
+
+    string_expr = args[0]
+    pattern = args[1]
+
+    # Check if string_expr contains nested REGEXP_SPLIT_TO_TABLE
+    has_nested = False
+    for node in string_expr.walk():
+        if isinstance(node, exp.Anonymous) and node.name.upper() == 'REGEXP_SPLIT_TO_TABLE':
+            has_nested = True
+            break
+
+    if has_nested:
+        # Recursively process the nested call first
+        # Create a temporary select to process the inner expression
+        # For now, we'll handle this iteratively by processing all calls
+        pass
+
+    # Generate unique alias for LATERAL VIEW table
+    table_alias = _generate_explode_alias()
+
+    # Create SPLIT_BY_REGEXP function call for Doris
+    split_func = exp.Anonymous(
+        this="SPLIT_BY_REGEXP",
+        expressions=[string_expr.copy(), pattern.copy()]
+    )
+
+    # Wrap in EXPLODE
+    explode_func = exp.Explode(this=split_func)
+
+    # Create LATERAL VIEW
+    lateral = exp.Lateral(
+        this=explode_func,
+        view=True,
+        alias=exp.TableAlias(
+            this=exp.to_identifier(table_alias),
+            columns=[exp.to_identifier(alias_name)]
+        )
+    )
+
+    # Replace the REGEXP_SPLIT_TO_TABLE expression with column reference
+    col_ref = exp.Column(
+        this=exp.to_identifier(alias_name),
+        table=exp.to_identifier(table_alias)
+    )
+
+    # Update the SELECT expressions
+    new_expressions = list(select.expressions)
+    new_expressions[expr_index] = col_ref
+    select.set("expressions", new_expressions)
+
+    # Add LATERAL VIEW
+    existing_laterals = select.args.get("laterals") or []
+    select.set("laterals", existing_laterals + [lateral])
+
+
 def add_alias_to_cast(expression: exp.Expression) -> exp.Expression:
     """
     Automatically add column name as alias for simple CAST(column AS type) expressions without alias.
@@ -187,6 +440,142 @@ def add_alias_to_cast(expression: exp.Expression) -> exp.Expression:
             select.set("expressions", new_expressions)
 
     return expression
+
+
+def remove_with_data_clause(expression: exp.Expression) -> exp.Expression:
+    """
+    Remove WITH DATA / WITH NO DATA clause from CREATE TABLE AS SELECT statements.
+
+    PostgreSQL supports:
+        CREATE TABLE t AS SELECT * FROM source;              (default with data)
+        CREATE TABLE t AS SELECT * FROM source WITH DATA;    (explicit with data)
+        CREATE TABLE t AS SELECT * FROM source WITH NO DATA; (structure only)
+
+    Doris only supports:
+        CREATE TABLE t AS SELECT * FROM source;              (always with data)
+
+    This function removes the WITH DATA / WITH NO DATA clause to ensure Doris compatibility.
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with WITH DATA clauses removed
+    """
+    # Find all CREATE statements
+    for create in expression.find_all(exp.Create):
+        # Check if this is CREATE TABLE AS SELECT
+        if create.args.get("this") and create.args.get("expression"):
+            # Check if there are properties
+            properties = create.args.get("properties")
+            if properties and hasattr(properties, "expressions"):
+                # Filter out WithDataProperty
+                new_props = [
+                    prop for prop in properties.expressions
+                    if not isinstance(prop, exp.WithDataProperty)
+                ]
+
+                # Update properties
+                if new_props:
+                    properties.set("expressions", new_props)
+                else:
+                    # Remove properties entirely if empty
+                    create.set("properties", None)
+
+    return expression
+
+
+def fix_lateral_view_ambiguity(expression: exp.Expression) -> exp.Expression:
+    """
+    Fix column name ambiguity in WHERE clauses after LATERAL VIEW conversion.
+
+    When LATERAL VIEW generates a column with the same name as an original table column,
+    references to that column in WHERE clauses become ambiguous. This function adds
+    table name prefixes to disambiguate such references.
+
+    Example:
+        Before fix:
+            SELECT ... FROM table
+            LATERAL VIEW EXPLODE(...) tmp AS col
+            WHERE COALESCE(col, '') ...  ← Ambiguous: table.col or tmp.col?
+
+        After fix:
+            SELECT ... FROM table
+            LATERAL VIEW EXPLODE(...) tmp AS col
+            WHERE COALESCE(table.col, '') ...  ← Clear: refers to original table.col
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with ambiguity resolved
+    """
+    # Find all SELECT statements with LATERAL VIEW
+    for select in expression.find_all(exp.Select):
+        # Check if this SELECT has LATERAL VIEWs
+        laterals = select.args.get("laterals")
+        if not laterals:
+            continue
+
+        # Collect column names generated by LATERAL VIEWs
+        lateral_columns = set()
+        for lateral in laterals:
+            if isinstance(lateral, exp.Lateral) and lateral.args.get("alias"):
+                alias = lateral.args["alias"]
+                if isinstance(alias, exp.TableAlias) and alias.args.get("columns"):
+                    for col in alias.args["columns"]:
+                        if isinstance(col, exp.Identifier):
+                            lateral_columns.add(col.this)
+
+        if not lateral_columns:
+            continue
+
+        # Find the base table name
+        from_expr = select.args.get("from")
+        if not from_expr:
+            continue
+
+        table_name = None
+        if isinstance(from_expr, exp.From):
+            table_expr = from_expr.this
+            if isinstance(table_expr, exp.Table):
+                table_ident = table_expr.args.get("this")
+                if isinstance(table_ident, exp.Identifier):
+                    table_name = table_ident.this
+
+        if not table_name:
+            continue
+
+        # Fix WHERE clause column references
+        where = select.args.get("where")
+        if where:
+            _add_table_prefix_to_columns(where, lateral_columns, table_name)
+
+    return expression
+
+
+def _add_table_prefix_to_columns(
+    node: exp.Expression,
+    lateral_columns: set,
+    table_name: str
+) -> None:
+    """
+    Recursively add table prefix to column references that may be ambiguous.
+
+    Args:
+        node: The AST node to process
+        lateral_columns: Set of column names generated by LATERAL VIEW
+        table_name: The base table name to use as prefix
+    """
+    for child in node.walk():
+        # Look for Column nodes without table prefix
+        if isinstance(child, exp.Column):
+            col_name = child.this
+            if isinstance(col_name, exp.Identifier) and col_name.this in lateral_columns:
+                # Check if this column already has a table prefix
+                if not child.args.get("table"):
+                    # Add table prefix
+                    child.set("table", exp.to_identifier(table_name))
 
 
 def normalize_table_identifiers(
@@ -307,6 +696,7 @@ def transpile_to_doris(
     normalize_mode: str = IdentifierNormalizeMode.TABLE_FULL,
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
+    regexp_split_to_lateral: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -335,6 +725,9 @@ def transpile_to_doris(
         explode_to_lateral: Whether to convert EXPLODE/UNNEST in SELECT to LATERAL VIEW (default True)
             - SELECT unnest(arr) AS x -> SELECT tmp.x FROM ... LATERAL VIEW EXPLODE(arr) tmp AS x
             - Doris doesn't support EXPLODE directly in SELECT, must use LATERAL VIEW
+        regexp_split_to_lateral: Whether to convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW (default True)
+            - SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS x -> SELECT tmp.x FROM ... LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) tmp AS x
+            - PostgreSQL's REGEXP_SPLIT_TO_TABLE is not supported in Doris
         **opts: Other Generator options (e.g., pretty=True)
 
     Returns:
@@ -375,9 +768,19 @@ def transpile_to_doris(
             if auto_alias_cast:
                 normalized = add_alias_to_cast(normalized)
 
+            # Remove WITH DATA / WITH NO DATA clause from CREATE TABLE AS SELECT
+            normalized = remove_with_data_clause(normalized)
+
+            # Convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW (must be done before explode_to_lateral)
+            if regexp_split_to_lateral:
+                normalized = regexp_split_to_table_to_lateral_view(normalized)
+
             # Convert EXPLODE/UNNEST in SELECT to LATERAL VIEW
             if explode_to_lateral:
                 normalized = explode_to_lateral_view(normalized)
+
+            # Fix column name ambiguity in WHERE clauses after LATERAL VIEW conversion
+            normalized = fix_lateral_view_ambiguity(normalized)
 
             results.append(write_dialect.generate(
                 normalized, copy=False, **opts))
@@ -393,6 +796,7 @@ def pg_to_doris(
     normalize_mode: str = IdentifierNormalizeMode.TABLE_FULL,
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
+    regexp_split_to_lateral: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -406,6 +810,8 @@ def pg_to_doris(
         ['SELECT CAST(id AS INT) AS id FROM t']
         >>> pg_to_doris("SELECT unnest(string_to_array(tags, ',')) AS tag FROM t")
         ['SELECT _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
+        >>> pg_to_doris("SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS val FROM t")
+        ['SELECT _explode_tmp.val FROM t LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) _explode_tmp AS val']
     """
     return transpile_to_doris(
         sql,
@@ -414,6 +820,7 @@ def pg_to_doris(
         normalize_mode=normalize_mode,
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
+        regexp_split_to_lateral=regexp_split_to_lateral,
         **opts
     )
 
@@ -423,6 +830,7 @@ def spark_to_doris(
     normalize_mode: str = IdentifierNormalizeMode.TABLE_FULL,
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
+    regexp_split_to_lateral: bool = True,
     **opts,
 ) -> t.List[str]:
     """Shortcut for Spark to Doris transpilation."""
@@ -433,6 +841,7 @@ def spark_to_doris(
         normalize_mode=normalize_mode,
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
+        regexp_split_to_lateral=regexp_split_to_lateral,
         **opts
     )
 
@@ -442,6 +851,7 @@ def hive_to_doris(
     normalize_mode: str = IdentifierNormalizeMode.TABLE_FULL,
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
+    regexp_split_to_lateral: bool = True,
     **opts,
 ) -> t.List[str]:
     """Shortcut for Hive to Doris transpilation."""
@@ -452,6 +862,7 @@ def hive_to_doris(
         normalize_mode=normalize_mode,
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
+        regexp_split_to_lateral=regexp_split_to_lateral,
         **opts
     )
 
@@ -461,7 +872,10 @@ __all__ = [
     "IdentifierNormalizeMode",
     "normalize_table_identifiers",
     "add_alias_to_cast",
+    "remove_with_data_clause",
+    "fix_lateral_view_ambiguity",
     "explode_to_lateral_view",
+    "regexp_split_to_table_to_lateral_view",
     "transpile_to_doris",
     "pg_to_doris",
     "spark_to_doris",

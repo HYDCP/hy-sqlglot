@@ -532,6 +532,92 @@ def run_explode_to_lateral_tests():
             print("⚠️ No LATERAL VIEW detected (may not need conversion)")
 
 
+def run_regexp_split_tests():
+    """Test REGEXP_SPLIT_TO_TABLE to LATERAL VIEW conversion"""
+
+    print("\n\n" + "="*70)
+    print(" REGEXP_SPLIT_TO_TABLE to LATERAL VIEW Tests")
+    print("="*70)
+
+    tests = [
+        # (name, SQL, description)
+        ("14.1 Simple REGEXP_SPLIT_TO_TABLE",
+         "SELECT id, REGEXP_SPLIT_TO_TABLE(col, ',') AS val FROM t",
+         "Simple split should become LATERAL VIEW with SPLIT_BY_REGEXP"),
+
+        ("14.2 Nested REGEXP_SPLIT_TO_TABLE",
+         "SELECT id, REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(col, '、'), '，') AS val FROM t",
+         "Nested splits should become multiple LATERAL VIEWs"),
+
+        ("14.3 User real-world scenario",
+         """SELECT xxx, xxxx, 
+            REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(REGEXP_REPLACE(interview, '[0-9]', '', 'g'), '、'), '，') AS interview 
+            FROM some_table""",
+         "Complex nested scenario with REGEXP_REPLACE"),
+
+        ("14.4 With WHERE clause",
+         "SELECT id, REGEXP_SPLIT_TO_TABLE(tags, ',') AS tag FROM t WHERE status = 1",
+         "LATERAL VIEW should preserve WHERE"),
+
+        ("14.5 In subquery",
+         "SELECT * FROM (SELECT id, REGEXP_SPLIT_TO_TABLE(tags, ',') AS tag FROM t) h WHERE tag <> ''",
+         "REGEXP_SPLIT_TO_TABLE inside subquery should convert"),
+
+        ("14.6 CREATE TABLE AS SELECT",
+         "CREATE TEMPORARY TABLE result AS SELECT id, REGEXP_SPLIT_TO_TABLE(tags, ',') AS tag FROM t",
+         "REGEXP_SPLIT_TO_TABLE in DDL should also convert"),
+
+        ("14.7 Triple nested",
+         "SELECT REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(REGEXP_SPLIT_TO_TABLE(col, 'a'), 'b'), 'c') AS val FROM t",
+         "Triple nesting should create three LATERAL VIEWs"),
+    ]
+
+    for name, sql, desc in tests:
+        print(f"\n{'='*70}")
+        print(f"Test: {name}")
+        print(f"{'='*70}")
+        print(f"Input SQL:")
+        # Format SQL for readability
+        sql_display = ' '.join(sql.split())
+        print(f"  {sql_display[:80]}..." if len(
+            sql_display) > 80 else f"  {sql_display}")
+        print(f"Description: {desc}")
+        print()
+
+        # Disable LATERAL VIEW conversion
+        without_lateral = pg_to_doris(sql, regexp_split_to_lateral=False)[0]
+        print(f"Without conversion (regexp_split_to_lateral=False):")
+        print(f"  {without_lateral[:100]}..." if len(
+            without_lateral) > 100 else f"  {without_lateral}")
+
+        # Enable LATERAL VIEW conversion (default)
+        with_lateral = pg_to_doris(sql)[0]
+        print(f"With conversion (regexp_split_to_lateral=True):")
+        # Format output for readability
+        if "LATERAL VIEW" in with_lateral:
+            # Pretty print LATERAL VIEWs on separate lines
+            parts = with_lateral.split(" LATERAL VIEW ")
+            formatted = parts[0]
+            for i, part in enumerate(parts[1:], 1):
+                formatted += f"\n  LATERAL VIEW {part}"
+            print(f"  {formatted}")
+        else:
+            print(f"  {with_lateral[:100]}..." if len(
+                with_lateral) > 100 else f"  {with_lateral}")
+
+        # Check for LATERAL VIEW and count
+        if "LATERAL VIEW" in with_lateral:
+            lateral_count = with_lateral.count("LATERAL VIEW")
+            print(f"✅ Converted to {lateral_count} LATERAL VIEW(s)")
+            # Verify SPLIT_BY_REGEXP is used
+            if "SPLIT_BY_REGEXP" in with_lateral:
+                print("✅ Using SPLIT_BY_REGEXP function")
+            else:
+                print("⚠️ SPLIT_BY_REGEXP not found")
+        else:
+            print("⚠️ No LATERAL VIEW detected (conversion may have failed)")
+
+
 def run_summary():
     """Output test summary"""
 
@@ -584,6 +670,9 @@ if __name__ == "__main__":
 
     # EXPLODE to LATERAL VIEW tests
     run_explode_to_lateral_tests()
+
+    # REGEXP_SPLIT_TO_TABLE to LATERAL VIEW tests
+    run_regexp_split_tests()
 
     # Output summary
     run_summary()
