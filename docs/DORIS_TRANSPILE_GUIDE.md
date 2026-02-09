@@ -14,6 +14,9 @@
 | REGEXP_SPLIT_TO_TABLE not supported | ❌ Doris doesn't support      | ✅ Auto-convert LATERAL VIEW  |
 | WITH DATA / WITH NO DATA clause     | ❌ Doris doesn't support      | ✅ Auto-remove clause         |
 | LATERAL VIEW column ambiguity       | ❌ Runtime error in Doris     | ✅ Auto-fix with table prefix |
+| ASCII function conversion           | ❌ ORD(CONVERT(...)) complex  | ✅ Keep ASCII() simple        |
+| Date format incompatibility         | ❌ Java format (yyyyMMdd)     | ✅ Convert to MySQL (%Y%m%d)  |
+| E-string quotes lost                | ❌ E'/' becomes /             | ✅ Normalize to '/'           |
 
 ---
 
@@ -22,7 +25,7 @@
 ### Installation
 
 ```bash
-pip install sqlglot-26.9.3-py3-none-any.whl
+pip install sqlglot-26.9.4-py3-none-any.whl
 ```
 
 ### Replace Existing Code
@@ -57,12 +60,15 @@ result = pg_to_doris(sql)
 ```python
 def transpile_to_doris(
     sql: str,
-    read: str = None,              # Source dialect: "postgres", "spark", "hive", "mysql", etc.
-    write: str = "doris",          # Target dialect, defaults to doris
+    read: str = None,                       # Source dialect: "postgres", "spark", "hive", "mysql", etc.
+    write: str = "doris",                   # Target dialect, defaults to doris
     normalize_mode: str = "table_full",     # Identifier normalization mode
     auto_alias_cast: bool = True,           # Auto-add alias for CAST
     explode_to_lateral: bool = True,        # EXPLODE to LATERAL VIEW
     regexp_split_to_lateral: bool = True,   # REGEXP_SPLIT_TO_TABLE to LATERAL VIEW
+    preserve_ascii: bool = True,            # Preserve ASCII() function
+    convert_date_formats: bool = True,      # Convert Java → MySQL date formats
+    normalize_strings: bool = True,         # Normalize E-strings
     pretty: bool = False,                   # Format output
     **opts,                                 # Other Generator options
 ) -> List[str]:
@@ -307,6 +313,119 @@ result = pg_to_doris(sql)[0]
 
 This feature is **always enabled** and cannot be disabled, as it prevents runtime errors in Doris.
 
+### 7. Preserve ASCII Function
+
+PostgreSQL's `ascii()` function is transpiled to a complex `ORD(CONVERT(...))` expression by SQLGlot, but Doris natively supports `ASCII()`, so we preserve it.
+
+```python
+sql = "SELECT ascii(name) FROM users"
+result = pg_to_doris(sql)[0]
+# Output: SELECT ASCII(name) FROM users
+# Instead of: SELECT ORD(CONVERT(name USING utf32)) FROM users
+```
+
+**Conversion Rules:**
+
+| PostgreSQL   | SQLGlot Default (Doris)         | transpile_to_doris (Doris) |
+| ------------ | ------------------------------- | -------------------------- |
+| `ascii(col)` | `ORD(CONVERT(col USING utf32))` | `ASCII(col)`               |
+
+```python
+# Disable this feature
+result = pg_to_doris(sql, preserve_ascii=False)[0]
+```
+
+### 8. Convert Date Format Patterns
+
+Doris supports both Java-style (`yyyyMMdd`) and MySQL-style (`%Y%m%d`) date formats, but MySQL-style is more standard. We automatically convert Java format to MySQL format for consistency.
+
+```python
+sql = "SELECT str_to_date('20200101', 'yyyyMMdd')"
+result = pg_to_doris(sql)[0]
+# Output: SELECT STR_TO_DATE('20200101', '%Y%m%d')
+```
+
+**Format Mapping:**
+
+| Java Format | MySQL Format | Description     |
+| ----------- | ------------ | --------------- |
+| `yyyy`      | `%Y`         | 4-digit year    |
+| `yy`        | `%y`         | 2-digit year    |
+| `MM`        | `%m`         | Month (01-12)   |
+| `dd`        | `%d`         | Day (01-31)     |
+| `HH`        | `%H`         | Hour (00-23)    |
+| `mm`        | `%i`         | Minutes (00-59) |
+| `ss`        | `%s`         | Seconds (00-59) |
+
+**Example:**
+```python
+sql = "SELECT str_to_date('2020-01-01 12:30:45', 'yyyy-MM-dd HH:mm:ss')"
+result = pg_to_doris(sql)[0]
+# Output: SELECT STR_TO_DATE('2020-01-01 12:30:45', '%Y-%m-%d %H:%i:%s')
+```
+
+```python
+# Disable this feature
+result = pg_to_doris(sql, convert_date_formats=False)[0]
+```
+
+### 9. Normalize E-Strings
+
+PostgreSQL's E-strings (`E'...'`) support C-style escape sequences. SQLGlot parses them as `ByteString` nodes which lose quotes during generation. We convert them to proper string literals with correct escaping for Doris.
+
+**Simple String Example:**
+
+```python
+sql = "SELECT regexp_replace(col, E'/', ',')"
+result = pg_to_doris(sql)[0]
+# Output: SELECT REGEXP_REPLACE(col, '/', ',')
+# Instead of: SELECT REGEXP_REPLACE(col, /, ',')  ← Missing quotes!
+```
+
+**Regular Expression Example:**
+
+```python
+# PostgreSQL E-string with regex escape sequences
+sql = r"SELECT regexp_replace(text, E'\\s+', ' ')"
+result = pg_to_doris(sql)[0]
+# Output: SELECT REGEXP_REPLACE(text, '\\s+', ' ')
+# Doris will parse '\\s+' as '\s+' for the regex engine
+```
+
+**Complex Regex Pattern:**
+
+```python
+sql = r"""
+SELECT regexp_replace(
+    raw_log, 
+    E'^\\s*(\\w+)\\s*\\[(\\d{4}-\\d{2}-\\d{2})\\]',
+    E'[\\1][\\2]'
+)
+"""
+result = pg_to_doris(sql)[0]
+# Output: REGEXP_REPLACE(raw_log, '^\\s*(\\w+)\\s*\\[(\\d{4}-\\d{2}-\\d{2})\\]', '[\\1][\\2]')
+# All \s, \w, \d escape sequences are correctly preserved
+```
+
+**Conversion Rules:**
+
+| PostgreSQL  | Problem                    | transpile_to_doris   | Doris Interprets |
+| ----------- | -------------------------- | -------------------- | ---------------- |
+| `E'/'`      | Generates `/` (no quotes)  | Generates `'/'`      | `/`              |
+| `E'\\s+'`   | Over-escaped: `'\\\\s+'`   | Generates `'\\s+'`   | `\s+` (regex)    |
+| `E'\\w+'`   | Over-escaped: `'\\\\w+'`   | Generates `'\\w+'`   | `\w+` (regex)    |
+| `E'\\d{4}'` | Over-escaped: `'\\\\d{4}'` | Generates `'\\d{4}'` | `\d{4}` (regex)  |
+
+**Key Points:**
+- PostgreSQL `E'\\s'` (double backslash) represents a single backslash in the string
+- Doris `'\\s'` (double backslash in SQL) is parsed as `\s` (single backslash) by Doris
+- The regex engine receives `\s` which correctly matches whitespace
+
+```python
+# Disable this feature
+result = pg_to_doris(sql, normalize_strings=False)[0]
+```
+
 ---
 
 ## Usage Examples
@@ -459,14 +578,17 @@ result = transpile(sql, read="postgres", write="doris")
 
 `transpile_to_doris` signature is compatible with `sqlglot.transpile`, new parameters have defaults:
 
-| Parameter                 | Default        | Description                              |
-| ------------------------- | -------------- | ---------------------------------------- |
-| `normalize_mode`          | `"table_full"` | Normalize table + alias + refs           |
-| `auto_alias_cast`         | `True`         | Auto-add CAST alias                      |
-| `explode_to_lateral`      | `True`         | EXPLODE to LATERAL VIEW                  |
-| `regexp_split_to_lateral` | `True`         | REGEXP_SPLIT_TO_TABLE to LATERAL VIEW    |
-| `remove_with_data`        | Always enabled | Remove WITH DATA clause (cannot disable) |
-| `fix_ambiguity`           | Always enabled | Fix column ambiguity (cannot disable)    |
+| Parameter                 | Default        | Description                               |
+| ------------------------- | -------------- | ----------------------------------------- |
+| `normalize_mode`          | `"table_full"` | Normalize table + alias + refs            |
+| `auto_alias_cast`         | `True`         | Auto-add CAST alias                       |
+| `explode_to_lateral`      | `True`         | EXPLODE to LATERAL VIEW                   |
+| `regexp_split_to_lateral` | `True`         | REGEXP_SPLIT_TO_TABLE to LATERAL VIEW     |
+| `preserve_ascii`          | `True`         | Keep ASCII() instead of ORD(CONVERT(...)) |
+| `convert_date_formats`    | `True`         | Convert Java format → MySQL format        |
+| `normalize_strings`       | `True`         | Normalize E-strings with proper quotes    |
+| `remove_with_data`        | Always enabled | Remove WITH DATA clause (cannot disable)  |
+| `fix_ambiguity`           | Always enabled | Fix column ambiguity (cannot disable)     |
 
 ### Disable Enhanced Features
 
@@ -479,7 +601,10 @@ result = transpile_to_doris(
     normalize_mode="none",
     auto_alias_cast=False,
     explode_to_lateral=False,
-    regexp_split_to_lateral=False
+    regexp_split_to_lateral=False,
+    preserve_ascii=False,
+    convert_date_formats=False,
+    normalize_strings=False
 )
 ```
 
@@ -487,7 +612,7 @@ result = transpile_to_doris(
 
 ## Version Info
 
-- **Package Version**: `sqlglot-26.9.3`
+- **Package Version**: `sqlglot-26.9.4`
 - **Python Requirement**: `>= 3.7`
 - **Based on**: SQLGlot v26.9.0
-- **Features**: 6 automatic conversions for PostgreSQL to Doris migration
+- **Features**: 9 automatic conversions for PostgreSQL to Doris migration

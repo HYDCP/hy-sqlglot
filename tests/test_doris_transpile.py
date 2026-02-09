@@ -618,6 +618,162 @@ def run_regexp_split_tests():
             print("⚠️ No LATERAL VIEW detected (conversion may have failed)")
 
 
+def run_ascii_preserve_tests():
+    """Test ASCII function preservation"""
+
+    print("\n\n" + "="*70)
+    print(" ASCII Function Preservation Tests")
+    print("="*70)
+
+    tests = [
+        # (name, SQL, description)
+        ("15.1 Simple ASCII function",
+         "SELECT ascii(name) FROM users",
+         "Should keep ASCII() instead of ORD(CONVERT(...))"),
+
+        ("15.2 ASCII in WHERE clause",
+         "SELECT * FROM users WHERE ascii(name) > 65",
+         "ASCII in WHERE should also be preserved"),
+
+        ("15.3 ASCII with CAST",
+         "SELECT cast(ascii(name) as varchar) FROM users",
+         "ASCII with CAST should be preserved"),
+    ]
+
+    for name, sql, desc in tests:
+        print(f"\n{'='*70}")
+        print(f"Test: {name}")
+        print(f"{'='*70}")
+        print(f"Input SQL: {sql}")
+        print(f"Description: {desc}")
+        print()
+
+        # With ASCII preservation (default)
+        with_ascii = pg_to_doris(sql)[0]
+        print(f"Output:")
+        print(f"  {with_ascii}")
+
+        if 'ASCII' in with_ascii and 'ORD' not in with_ascii:
+            print("✅ ASCII function preserved")
+        else:
+            print("⚠️ ASCII not preserved")
+
+
+def run_date_format_tests():
+    """Test date format pattern conversion"""
+
+    print("\n\n" + "="*70)
+    print(" Date Format Pattern Conversion Tests")
+    print("="*70)
+
+    tests = [
+        # (name, SQL, java_format, mysql_format, description)
+        ("16.1 Simple date format",
+         "SELECT str_to_date('20200101', 'yyyyMMdd')",
+         "yyyyMMdd",
+         "%Y%m%d",
+         "Java format should convert to MySQL format"),
+
+        ("16.2 Date with separators",
+         "SELECT str_to_date('2020-01-01', 'yyyy-MM-dd')",
+         "yyyy-MM-dd",
+         "%Y-%m-%d",
+         "Date with dashes should convert"),
+
+        ("16.3 Datetime format",
+         "SELECT str_to_date('2020-01-01 12:30:45', 'yyyy-MM-dd HH:mm:ss')",
+         "yyyy-MM-dd HH:mm:ss",
+         "%Y-%m-%d %H:%i:%s",
+         "Full datetime should convert correctly"),
+
+        ("16.4 Short year format",
+         "SELECT str_to_date('200101', 'yyMMdd')",
+         "yyMMdd",
+         "%y%m%d",
+         "Short year format should convert"),
+    ]
+
+    for name, sql, java_fmt, mysql_fmt, desc in tests:
+        print(f"\n{'='*70}")
+        print(f"Test: {name}")
+        print(f"{'='*70}")
+        print(f"Input SQL: {sql}")
+        print(f"Description: {desc}")
+        print()
+
+        result = pg_to_doris(sql)[0]
+        print(f"Output: {result}")
+
+        if mysql_fmt in result:
+            print(f"✅ Format converted: {java_fmt} → {mysql_fmt}")
+        else:
+            print(f"⚠️ Format not converted properly")
+
+
+def run_estring_tests():
+    """Test E-string normalization"""
+
+    print("\n\n" + "="*70)
+    print(" E-String Normalization Tests")
+    print("="*70)
+
+    tests = [
+        # (name, SQL, description, expected_pattern)
+        ("17.1 E-string with slash",
+         "SELECT regexp_replace(col, E'/', ',')",
+         "E-string with slash should keep quotes",
+         "'/'"),
+
+        ("17.2 E-string with comma",
+         "SELECT regexp_replace(col, ',', E',')",
+         "E-string in different position",
+         "','"),
+
+        ("17.3 Multiple E-strings",
+         "SELECT regexp_replace(regexp_replace(col, E'/', ','), E',', ';')",
+         "Multiple E-strings should all be normalized",
+         "'/'"),
+
+        ("17.4 E-string in WHERE",
+         "SELECT * FROM t WHERE col = E'test'",
+         "E-string in WHERE clause",
+         "'test'"),
+
+        ("17.5 E-string with regex \\s",
+         r"SELECT regexp_replace(col, E'\\s+', ' ')",
+         "E-string with \\s should output correct escaping",
+         "'\\\\s+'"),
+
+        ("17.6 E-string with regex \\w",
+         r"SELECT regexp_replace(col, E'\\w+', '_')",
+         "E-string with \\w should output correct escaping",
+         "'\\\\w+'"),
+
+        ("17.7 Complex regex pattern",
+         r"SELECT regexp_replace(raw_log, E'^\\s*(\\w+)\\s*\\[(\\d{4})\\]', E'[\\1][\\2]')",
+         "Complex regex with multiple escape sequences",
+         "'^\\\\s*(\\\\w+)'"),
+    ]
+
+    for name, sql, desc, expected_pattern in tests:
+        print(f"\n{'='*70}")
+        print(f"Test: {name}")
+        print(f"{'='*70}")
+        print(f"Input SQL: {sql}")
+        print(f"Description: {desc}")
+        print()
+
+        result = pg_to_doris(sql)[0]
+        print(f"Output: {result}")
+
+        # Check for expected pattern
+        if expected_pattern in result:
+            print(
+                f"✅ E-strings normalized correctly - contains: {expected_pattern}")
+        else:
+            print(f"⚠️ Expected pattern not found: {expected_pattern}")
+
+
 def run_summary():
     """Output test summary"""
 
@@ -625,23 +781,32 @@ def run_summary():
     print(" Test Summary")
     print("="*70)
     print("""
-Feature Overview:
-  - transpile_to_doris() defaults to TABLE_FULL mode
-  - Normalizes: table names, table aliases, table references in columns
-  - Does NOT modify: column names, quoted identifiers, column aliases
-  - Auto-converts SELECT EXPLODE/UNNEST to LATERAL VIEW syntax
+Feature Overview (9 automatic conversions):
+  1. Table/alias case normalization - Unifies T.id and t.id to t.id
+  2. CAST auto-alias - Prevents __cast_0 column names
+  3. UNNEST → LATERAL VIEW - Converts PostgreSQL UNNEST syntax
+  4. REGEXP_SPLIT_TO_TABLE → LATERAL VIEW - Supports nested calls
+  5. Remove WITH DATA clause - Strips PostgreSQL-only syntax
+  6. Fix LATERAL VIEW ambiguity - Adds table prefixes to resolve conflicts
+  7. Preserve ASCII function - Keeps ASCII() instead of ORD(CONVERT(...))
+  8. Convert date formats - Java format (yyyyMMdd) → MySQL format (%Y%m%d)
+  9. Normalize E-strings - Fixes PostgreSQL E-string quotes
 
 Usage:
   from sqlglot.contrib.doris_transpile import transpile_to_doris
   
-  # Default mode (recommended)
+  # Default mode (all features enabled)
   result = transpile_to_doris(sql, read="postgres")
   
-  # Specify mode
-  result = transpile_to_doris(sql, read="postgres", normalize_mode="table_refs")
-  
-  # Disable EXPLODE to LATERAL VIEW conversion
-  result = transpile_to_doris(sql, read="postgres", explode_to_lateral=False)
+  # Disable specific features
+  result = transpile_to_doris(
+      sql, 
+      read="postgres",
+      explode_to_lateral=False,      # Disable EXPLODE conversion
+      preserve_ascii=False,           # Disable ASCII preservation
+      convert_date_formats=False,     # Disable date format conversion
+      normalize_strings=False         # Disable E-string normalization
+  )
 
 Available Modes:
   - none: No normalization (original transpile behavior)
@@ -652,9 +817,21 @@ Available Modes:
   - table_full: Normalize table names + aliases + table refs in columns (default)
   - all: Normalize all identifiers (including column names)
 
-EXPLODE/UNNEST Conversion:
-  - PostgreSQL: SELECT unnest(arr) AS x FROM t
-  - Doris:      SELECT tmp.x FROM t LATERAL VIEW EXPLODE(arr) tmp AS x
+Key Conversions:
+  - UNNEST:              SELECT unnest(arr) AS x FROM t
+                      → SELECT tmp.x FROM t LATERAL VIEW EXPLODE(arr) tmp AS x
+  
+  - REGEXP_SPLIT_TO_TABLE: SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS x FROM t
+                        → SELECT tmp.x FROM t LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) tmp AS x
+  
+  - ASCII:               SELECT ascii(name) FROM t
+                      → SELECT ASCII(name) FROM t  (not ORD(CONVERT(...)))
+  
+  - Date Format:         STR_TO_DATE('20200101', 'yyyyMMdd')
+                      → STR_TO_DATE('20200101', '%Y%m%d')
+  
+  - E-String:            regexp_replace(col, E'/', ',')
+                      → REGEXP_REPLACE(col, '/', ',')
 """)
 
 
@@ -673,6 +850,11 @@ if __name__ == "__main__":
 
     # REGEXP_SPLIT_TO_TABLE to LATERAL VIEW tests
     run_regexp_split_tests()
+
+    # New features tests
+    run_ascii_preserve_tests()
+    run_date_format_tests()
+    run_estring_tests()
 
     # Output summary
     run_summary()

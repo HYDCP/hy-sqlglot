@@ -25,6 +25,7 @@ import typing as t
 
 from sqlglot import exp, parse
 from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+from sqlglot.dialects.doris import Doris
 from sqlglot.errors import ErrorLevel
 
 if t.TYPE_CHECKING:
@@ -46,6 +47,56 @@ class IdentifierNormalizeMode:
     TABLE_REFS = "table_refs"
     # Normalize table names + aliases + table refs in columns (recommended)
     TABLE_FULL = "table_full"
+
+
+class DorisTranspileGenerator(Doris.Generator):
+    """
+    Custom Doris Generator that correctly handles PostgreSQL E-strings.
+
+    PostgreSQL E-strings (E'...') are parsed by SQLGlot as ByteString nodes.
+    The default Doris generator doesn't handle ByteString properly, losing quotes
+    and not handling escape sequences correctly.
+
+    This custom generator overrides bytestring_sql() to:
+    1. Convert ByteString to proper quoted string literals
+    2. Adjust backslash escaping for regex patterns
+    """
+
+    def bytestring_sql(self, expression: exp.ByteString) -> str:
+        """
+        Generate SQL for PostgreSQL E-string (parsed as ByteString).
+
+        PostgreSQL E-strings with double backslashes (E'\\\\s') represent single
+        backslashes in the actual string. We need to reduce the escaping level
+        by half because Doris's string parser will interpret escape sequences.
+
+        Examples:
+            E'/'       → '/'
+            E'\\\\s+'  → '\\s+' (Doris parses to \\s+, regex engine receives \\s+)
+            E'\\\\w+'  → '\\w+' (Doris parses to \\w+, regex engine receives \\w+)
+
+        Args:
+            expression: The ByteString expression node
+
+        Returns:
+            Properly quoted and escaped string literal for Doris
+        """
+        string_value = expression.this
+
+        # Reduce backslash escaping by half
+        # ByteString.this contains '\\\\s' (2 backslash chars)
+        # We want to output SQL with '\\s' (which needs to be escaped for SQL output)
+        if string_value and '\\\\' in string_value:
+            string_value = string_value.replace('\\\\', '\\')
+
+        # Manually escape for SQL output
+        # Escape single quotes and backslashes
+        # SQL standard: double single quotes
+        escaped = string_value.replace("'", "''")
+        # Escape backslashes for SQL
+        escaped = escaped.replace("\\", "\\\\")
+
+        return f"'{escaped}'"
 
 
 def _generate_explode_alias() -> str:
@@ -687,6 +738,117 @@ def normalize_table_identifiers(
     return expression
 
 
+def preserve_ascii_function(expression: exp.Expression) -> exp.Expression:
+    """
+    Preserve ASCII() function instead of converting to ORD(CONVERT(...)).
+
+    Doris natively supports ASCII() function, so we don't need the complex conversion
+    that SQLGlot performs when transpiling from PostgreSQL.
+
+    PostgreSQL's ascii(col) is parsed as UNICODE(col) by SQLGlot, and when generating
+    to Doris it becomes ORD(CONVERT(col USING utf32)). We convert it back to ASCII(col).
+
+    Converts:
+        UNICODE(col) -> ASCII(col)
+
+    Args:
+        expression: The expression tree to process
+
+    Returns:
+        Modified expression with ASCII preserved
+
+    Example:
+        >>> from sqlglot import parse
+        >>> from sqlglot.contrib.doris_transpile import preserve_ascii_function
+        >>> tree = parse("SELECT ascii(name)", read="postgres")[0]
+        >>> result = preserve_ascii_function(tree)
+        >>> result.sql(dialect="doris")
+        'SELECT ASCII(name)'
+    """
+    # Find all Unicode nodes (PostgreSQL's ascii() is parsed as UNICODE())
+    for node in expression.find_all(exp.Unicode):
+        # Replace UNICODE(col) with ASCII(col)
+        inner_col = node.this
+        ascii_func = exp.Anonymous(this="ASCII", expressions=[inner_col])
+        node.replace(ascii_func)
+
+    return expression
+
+
+def convert_date_format_patterns(expression: exp.Expression) -> exp.Expression:
+    """
+    Convert Java-style date format patterns to MySQL-style for STR_TO_DATE.
+
+    Doris supports both Java-style (yyyyMMdd) and MySQL-style (%Y%m%d) formats,
+    but MySQL-style is more standard and consistent across Doris functions.
+
+    Converts:
+        'yyyyMMdd' -> '%Y%m%d'
+        'yyyy-MM-dd' -> '%Y-%m-%d'
+        'yyyy-MM-dd HH:mm:ss' -> '%Y-%m-%d %H:%i:%s'
+
+    Args:
+        expression: The expression tree to process
+
+    Returns:
+        Modified expression with converted date formats
+
+    Example:
+        >>> from sqlglot import parse
+        >>> from sqlglot.contrib.doris_transpile import convert_date_format_patterns
+        >>> tree = parse("SELECT str_to_date('20200101', 'yyyyMMdd')", read="postgres")[0]
+        >>> result = convert_date_format_patterns(tree)
+        >>> result.sql(dialect="doris")
+        "SELECT STR_TO_DATE('20200101', '%Y%m%d')"
+    """
+    # Java to MySQL format mapping
+    # Order matters - process longer patterns first to avoid partial replacements
+    format_mapping = [
+        ('yyyy', '%Y'),  # 4-digit year
+        ('yy', '%y'),    # 2-digit year
+        ('MM', '%m'),    # Month (01-12)
+        ('dd', '%d'),    # Day (01-31)
+        ('HH', '%H'),    # Hour (00-23)
+        ('hh', '%h'),    # Hour (01-12)
+        ('mm', '%i'),    # Minutes (00-59) - MySQL uses %i for minutes
+        ('ss', '%s'),    # Seconds (00-59)
+        ('SSS', '%f'),   # Milliseconds
+        ('a', '%p'),     # AM/PM
+    ]
+
+    # Find all StrToDate and StrToTime nodes
+    for node in list(expression.find_all(exp.StrToDate)) + list(expression.find_all(exp.StrToTime)):
+        format_arg = node.args.get("format")
+        if format_arg and isinstance(format_arg, exp.Literal):
+            original_format = format_arg.this
+            if original_format and isinstance(original_format, str):
+                # Check if it's Java-style format (contains 'yyyy', 'MM', 'dd', etc.)
+                if any(java_pattern in original_format for java_pattern, _ in format_mapping):
+                    # Smart handling for lowercase 'mm':
+                    # If format contains time separators (: or space before/after time patterns),
+                    # treat 'mm' as minutes. Otherwise, treat as month (common mistake).
+                    has_time_separator = ':' in original_format or (
+                        ('HH' in original_format or 'hh' in original_format) and
+                        (' ' in original_format or 'T' in original_format)
+                    )
+
+                    # Convert Java format to MySQL format
+                    new_format = original_format
+                    for java_pattern, mysql_pattern in format_mapping:
+                        # Special handling for lowercase 'mm'
+                        if java_pattern == 'mm' and not has_time_separator:
+                            # In pure date format (no time separator), treat 'mm' as month
+                            new_format = new_format.replace('mm', '%m')
+                        else:
+                            new_format = new_format.replace(
+                                java_pattern, mysql_pattern)
+
+                    # Update the format literal
+                    format_arg.set("this", new_format)
+
+    return expression
+
+
 def transpile_to_doris(
     sql: str,
     read: DialectType = None,
@@ -697,6 +859,8 @@ def transpile_to_doris(
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
     regexp_split_to_lateral: bool = True,
+    preserve_ascii: bool = True,
+    convert_date_formats: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -728,7 +892,17 @@ def transpile_to_doris(
         regexp_split_to_lateral: Whether to convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW (default True)
             - SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS x -> SELECT tmp.x FROM ... LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) tmp AS x
             - PostgreSQL's REGEXP_SPLIT_TO_TABLE is not supported in Doris
+        preserve_ascii: Whether to preserve ASCII() function instead of converting to ORD(CONVERT(...)) (default True)
+            - Doris natively supports ASCII(), no need for complex conversion
+            - ORD(CONVERT(col USING utf32)) -> ASCII(col)
+        convert_date_formats: Whether to convert Java-style date formats to MySQL-style (default True)
+            - 'yyyyMMdd' -> '%Y%m%d' for STR_TO_DATE
+            - Ensures consistency with Doris date format functions
         **opts: Other Generator options (e.g., pretty=True)
+
+    Note:
+        PostgreSQL E-strings (E'...') are automatically handled by DorisTranspileGenerator.
+        No additional parameter is needed - E-strings are properly converted with correct escaping.
 
     Returns:
         List of transpiled SQL statements
@@ -757,6 +931,14 @@ def transpile_to_doris(
     results = []
     for expression in parse(sql, read, error_level=error_level):
         if expression:
+            # Preserve ASCII function (before normalization)
+            if preserve_ascii:
+                expression = preserve_ascii_function(expression)
+
+            # Convert date format patterns (before normalization)
+            if convert_date_formats:
+                expression = convert_date_format_patterns(expression)
+
             # Apply identifier normalization
             normalized = normalize_table_identifiers(
                 expression,
@@ -782,8 +964,14 @@ def transpile_to_doris(
             # Fix column name ambiguity in WHERE clauses after LATERAL VIEW conversion
             normalized = fix_lateral_view_ambiguity(normalized)
 
-            results.append(write_dialect.generate(
-                normalized, copy=False, **opts))
+            # Use custom generator for Doris to handle E-strings correctly
+            if write == "doris":
+                generator = DorisTranspileGenerator()
+                results.append(generator.generate(
+                    normalized, copy=False, **opts))
+            else:
+                results.append(write_dialect.generate(
+                    normalized, copy=False, **opts))
         else:
             results.append("")
 
@@ -870,12 +1058,15 @@ def hive_to_doris(
 # Exports
 __all__ = [
     "IdentifierNormalizeMode",
+    "DorisTranspileGenerator",
     "normalize_table_identifiers",
     "add_alias_to_cast",
     "remove_with_data_clause",
     "fix_lateral_view_ambiguity",
     "explode_to_lateral_view",
     "regexp_split_to_table_to_lateral_view",
+    "preserve_ascii_function",
+    "convert_date_format_patterns",
     "transpile_to_doris",
     "pg_to_doris",
     "spark_to_doris",
