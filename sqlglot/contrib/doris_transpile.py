@@ -966,9 +966,9 @@ def transpile_to_doris(
 
             # Use custom generator for Doris to handle E-strings correctly
             if write == "doris":
-                generator = DorisTranspileGenerator()
-                results.append(generator.generate(
-                    normalized, copy=False, **opts))
+                # Pass Generator options (pretty, indent, etc.) to constructor
+                generator = DorisTranspileGenerator(**opts)
+                results.append(generator.generate(normalized, copy=False))
             else:
                 results.append(write_dialect.generate(
                     normalized, copy=False, **opts))
