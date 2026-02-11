@@ -21,11 +21,13 @@ Usage:
 
 from __future__ import annotations
 
+import re
 import typing as t
 
 from sqlglot import exp, parse
 from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
 from sqlglot.dialects.doris import Doris
+from sqlglot.dialects.postgres import Postgres
 from sqlglot.errors import ErrorLevel
 
 if t.TYPE_CHECKING:
@@ -849,6 +851,198 @@ def convert_date_format_patterns(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def add_where_to_delete(expression: exp.Expression) -> exp.Expression:
+    """
+    Add WHERE 1=1 to DELETE statements that have no WHERE clause.
+
+    Doris requires DELETE statements to have a WHERE clause. Without it,
+    the DELETE statement will fail with a syntax error.
+
+    Before (PostgreSQL):
+        DELETE FROM schema1.table1;
+
+    After (Doris):
+        DELETE FROM schema1.table1 WHERE 1 = 1;
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with WHERE 1=1 added to DELETE statements
+    """
+    for delete in expression.find_all(exp.Delete):
+        if delete.args.get("where") is None:
+            # Add WHERE 1 = 1
+            where_clause = exp.Where(
+                this=exp.EQ(
+                    this=exp.Literal.number(1),
+                    expression=exp.Literal.number(1),
+                )
+            )
+            delete.set("where", where_clause)
+
+    return expression
+
+
+def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
+    """
+    Convert date arithmetic (date +/- integer) to DATE_ADD/DATE_SUB with INTERVAL.
+
+    PostgreSQL supports `date - 1` to subtract 1 day from a date, but Doris
+    does not support arithmetic with plain integers on dates. Doris requires
+    DATE_ADD/DATE_SUB with INTERVAL syntax.
+
+    Before (PostgreSQL):
+        date(date_trunc('month', DATE '2026-02-10')) - 1
+        current_date - 7
+        DATE '2026-01-01' + 30
+
+    After (Doris):
+        DATE_ADD(DATE_TRUNC(CAST('2026-02-10' AS DATE), 'MONTH'), INTERVAL -1 DAY)
+        DATE_ADD(CURRENT_DATE, INTERVAL -7 DAY)
+        DATE_ADD(CAST('2026-01-01' AS DATE), INTERVAL 30 DAY)
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with date arithmetic converted
+    """
+    for node in list(expression.find_all(exp.Sub, exp.Add)):
+        left = node.this
+        right = node.expression
+
+        # Pattern: date_expr +/- integer_literal
+        if isinstance(right, exp.Literal) and not right.is_string and _is_date_expression(left):
+            n = int(right.this)
+            if isinstance(node, exp.Sub):
+                n = -n
+
+            # Unwrap redundant DATE() wrapper
+            # DATE(DATE_TRUNC(...)) → DATE_TRUNC(...)
+            date_expr = left.this if isinstance(left, exp.Date) else left
+
+            # Build DATE_ADD(date_expr, INTERVAL n DAY)
+            date_add = exp.DateAdd(
+                this=date_expr.copy(),
+                expression=exp.Literal.number(n),
+                unit=exp.Var(this="DAY"),
+            )
+            node.replace(date_add)
+
+    return expression
+
+
+def _is_date_expression(node: exp.Expression) -> bool:
+    """
+    Check if an expression is a date-type expression.
+
+    Recognizes:
+        - DATE(...) function
+        - CAST(... AS DATE)
+        - DATE_TRUNC / TIMESTAMP_TRUNC
+        - CURRENT_DATE / CURRENT_TIMESTAMP
+        - Date literal: DATE '2026-01-01'
+
+    Args:
+        node: The expression to check
+
+    Returns:
+        True if the expression produces a date-type result
+    """
+    if isinstance(node, exp.Date):
+        return True
+    if isinstance(node, exp.Cast):
+        to_type = node.args.get("to")
+        if isinstance(to_type, exp.DataType) and to_type.this in (
+            exp.DataType.Type.DATE,
+            exp.DataType.Type.DATETIME,
+            exp.DataType.Type.TIMESTAMP,
+            exp.DataType.Type.TIMESTAMPTZ,
+        ):
+            return True
+    if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
+        return True
+    if isinstance(node, exp.CurrentDate):
+        return True
+    if isinstance(node, exp.CurrentTimestamp):
+        return True
+    # Anonymous functions that return dates
+    if isinstance(node, exp.Anonymous) and node.name.upper() in (
+        "DATE_TRUNC", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
+    ):
+        return True
+
+    return False
+
+
+def preprocess_date_cast_syntax(sql: str) -> str:
+    """
+    Preprocess SQL to rewrite DATE'...'::type into CAST(DATE '...' AS type).
+
+    SQLGlot's PostgreSQL parser cannot handle `::` cast directly after a DATE literal.
+    This function rewrites the pattern into standard CAST syntax before parsing.
+
+    Patterns handled:
+        DATE'20260201'::varchar      → CAST(DATE '20260201' AS varchar)
+        DATE '2026-02-01'::text      → CAST(DATE '2026-02-01' AS text)
+        date '2026-02-01'::varchar   → CAST(DATE '2026-02-01' AS varchar)
+
+    After SQLGlot parsing and Doris generation:
+        → CAST(CAST('2026-02-01' AS DATE) AS VARCHAR)
+
+    Args:
+        sql: The raw SQL string to preprocess
+
+    Returns:
+        The preprocessed SQL string
+    """
+    # Match: DATE followed by optional space, then a quoted string, then ::type
+    pattern = r"\bDATE\s*'([^']*)'\s*::\s*(\w+)"
+    replacement = r"CAST(DATE '\1' AS \2)"
+    return re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
+
+
+class PostgresDoris(Postgres):
+    """
+    Extended PostgreSQL dialect with Doris-targeted SQL preprocessing.
+
+    Inherits all PostgreSQL parsing behavior, and additionally preprocesses
+    SQL to handle patterns that the standard PostgreSQL parser cannot parse
+    (e.g., DATE'...'::type).
+
+    This dialect is auto-registered under two keys when this module is imported:
+      - 'postgresdoris': explicit name for this enhanced dialect
+      - 'postgres': overrides the standard Postgres dialect so that existing code
+        using read='postgres' gets the preprocessing automatically
+
+    Usage:
+        import sqlglot
+        from sqlglot.contrib.doris_transpile import pg_to_doris  # triggers registration
+
+        # Both work identically — 'postgres' is now the enhanced version:
+        tree = sqlglot.parse_one("SELECT date'20260201'::varchar", read='postgres')
+        tree = sqlglot.parse_one("SELECT date'20260201'::varchar", read='postgresdoris')
+    """
+
+    def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
+        sql = preprocess_date_cast_syntax(sql)
+        return super().parse(sql, **opts)
+
+    def parse_into(
+        self, expression_type: exp.IntoType, sql: str, **opts
+    ) -> t.List[t.Optional[exp.Expression]]:
+        sql = preprocess_date_cast_syntax(sql)
+        return super().parse_into(expression_type, sql, **opts)
+
+
+# Register PostgresDoris as the 'postgres' dialect so that read='postgres'
+# transparently includes SQL preprocessing. This uses sqlglot's dialect registry
+# (not monkey patching) — only the registry entry is overridden.
+from sqlglot.dialects.dialect import _Dialect  # noqa: E402
+_Dialect._classes["postgres"] = PostgresDoris
+
+
 def transpile_to_doris(
     sql: str,
     read: DialectType = None,
@@ -861,6 +1055,8 @@ def transpile_to_doris(
     regexp_split_to_lateral: bool = True,
     preserve_ascii: bool = True,
     convert_date_formats: bool = True,
+    auto_add_delete_where: bool = True,
+    convert_date_arith: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -898,6 +1094,12 @@ def transpile_to_doris(
         convert_date_formats: Whether to convert Java-style date formats to MySQL-style (default True)
             - 'yyyyMMdd' -> '%Y%m%d' for STR_TO_DATE
             - Ensures consistency with Doris date format functions
+        auto_add_delete_where: Whether to auto-add WHERE 1=1 to DELETE without WHERE (default True)
+            - Doris requires DELETE statements to have a WHERE clause
+            - DELETE FROM t -> DELETE FROM t WHERE 1 = 1
+        convert_date_arith: Whether to convert date +/- integer to DATE_ADD with INTERVAL (default True)
+            - Doris doesn't support date - 1 syntax
+            - date - 1 -> DATE_ADD(date, INTERVAL -1 DAY)
         **opts: Other Generator options (e.g., pretty=True)
 
     Note:
@@ -964,10 +1166,20 @@ def transpile_to_doris(
             # Fix column name ambiguity in WHERE clauses after LATERAL VIEW conversion
             normalized = fix_lateral_view_ambiguity(normalized)
 
+            # Add WHERE 1=1 to DELETE statements without WHERE clause
+            if auto_add_delete_where:
+                normalized = add_where_to_delete(normalized)
+
+            # Convert date arithmetic (date +/- integer) to DATE_ADD with INTERVAL
+            if convert_date_arith:
+                normalized = convert_date_arithmetic(normalized)
+
             # Use custom generator for Doris to handle E-strings correctly
             if write == "doris":
                 # Pass Generator options (pretty, indent, etc.) to constructor
-                generator = DorisTranspileGenerator(**opts)
+                # Must pass dialect so IDENTIFIER_START/END use backticks (`) instead of double quotes (")
+                generator = DorisTranspileGenerator(
+                    dialect=write_dialect, **opts)
                 results.append(generator.generate(normalized, copy=False))
             else:
                 results.append(write_dialect.generate(
@@ -1059,6 +1271,7 @@ def hive_to_doris(
 __all__ = [
     "IdentifierNormalizeMode",
     "DorisTranspileGenerator",
+    "PostgresDoris",
     "normalize_table_identifiers",
     "add_alias_to_cast",
     "remove_with_data_clause",
@@ -1067,6 +1280,9 @@ __all__ = [
     "regexp_split_to_table_to_lateral_view",
     "preserve_ascii_function",
     "convert_date_format_patterns",
+    "add_where_to_delete",
+    "convert_date_arithmetic",
+    "preprocess_date_cast_syntax",
     "transpile_to_doris",
     "pg_to_doris",
     "spark_to_doris",
