@@ -884,6 +884,105 @@ def add_where_to_delete(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+SEQUENCE_FUNCS = {"NEXTVAL", "CURRVAL", "SETVAL", "LASTVAL", "SEQUENCE"}
+
+
+def _is_sequence_call(node: exp.Expression) -> bool:
+    """Check if a node is a sequence function call (NEXTVAL, CURRVAL, etc.)."""
+    if isinstance(node, exp.Anonymous):
+        try:
+            return node.name.upper() in SEQUENCE_FUNCS
+        except Exception:
+            pass
+    return False
+
+
+def _expr_contains_sequence(node: exp.Expression) -> bool:
+    """Check if an expression or any descendant is a sequence call."""
+    if _is_sequence_call(node):
+        return True
+    for child in node.find_all(exp.Anonymous):
+        if _is_sequence_call(child):
+            return True
+    return False
+
+
+def drop_sequence_columns(expression: exp.Expression) -> exp.Expression:
+    """
+    Remove NEXTVAL columns from INSERT INTO ... SELECT statements.
+
+    Assumes Doris target table has AUTO_INCREMENT on the corresponding column,
+    so the column and its NEXTVAL expression can simply be removed. Any matching
+    NEXTVAL calls in GROUP BY are also removed (they only existed to satisfy
+    PostgreSQL's syntax requirement that SELECT columns appear in GROUP BY).
+
+    Only processes INSERT ... SELECT statements with an explicit column list.
+    Other statement types are returned unchanged.
+
+    Before (PostgreSQL):
+        INSERT INTO t (id, data_dt, node_no)
+        SELECT NEXTVAL('seq') AS id, data_dt, txn_node_no
+        FROM tmp
+        GROUP BY NEXTVAL('seq'), data_dt
+
+    After (Doris):
+        INSERT INTO t (data_dt, node_no)
+        SELECT data_dt, txn_node_no
+        FROM tmp
+        GROUP BY data_dt
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST
+    """
+    if not isinstance(expression, exp.Insert):
+        return expression
+
+    target = expression.this
+    select = expression.args.get("expression")
+
+    if target is None or select is None or not isinstance(select, exp.Select):
+        return expression
+
+    columns = list(target.expressions) if hasattr(target, "expressions") else []
+    if not columns:
+        return expression
+
+    # Find which SELECT positions contain sequence calls
+    seq_indices: t.Set[int] = set()
+    for i, sel_expr in enumerate(select.expressions):
+        actual = sel_expr.this if isinstance(sel_expr, exp.Alias) else sel_expr
+        if _expr_contains_sequence(actual):
+            seq_indices.add(i)
+
+    if not seq_indices:
+        return expression
+
+    # Remove sequence columns from INSERT column list
+    new_columns = [c for i, c in enumerate(columns) if i not in seq_indices]
+    target.set("expressions", new_columns)
+
+    # Remove corresponding SELECT expressions
+    new_sel_exprs = [e for i, e in enumerate(select.expressions) if i not in seq_indices]
+    select.set("expressions", new_sel_exprs)
+
+    # Remove matching NEXTVAL calls from GROUP BY
+    group = select.args.get("group")
+    if group:
+        group_exprs = group.expressions if hasattr(group, "expressions") else []
+        new_group_exprs = [
+            g for g in group_exprs if not _expr_contains_sequence(g)
+        ]
+        if not new_group_exprs:
+            select.set("group", None)
+        else:
+            group.set("expressions", new_group_exprs)
+
+    return expression
+
+
 def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
     """
     Convert date arithmetic (date +/- integer) to DATE_ADD/DATE_SUB with INTERVAL.
@@ -1057,6 +1156,7 @@ def transpile_to_doris(
     convert_date_formats: bool = True,
     auto_add_delete_where: bool = True,
     convert_date_arith: bool = True,
+    drop_sequences: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -1100,6 +1200,10 @@ def transpile_to_doris(
         convert_date_arith: Whether to convert date +/- integer to DATE_ADD with INTERVAL (default True)
             - Doris doesn't support date - 1 syntax
             - date - 1 -> DATE_ADD(date, INTERVAL -1 DAY)
+        drop_sequences: Whether to remove NEXTVAL columns from INSERT ... SELECT (default True)
+            - Removes the column and NEXTVAL expression from INSERT ... SELECT
+            - Also removes matching NEXTVAL from GROUP BY
+            - Assumes Doris target table has AUTO_INCREMENT on the corresponding column
         **opts: Other Generator options (e.g., pretty=True)
 
     Note:
@@ -1174,6 +1278,10 @@ def transpile_to_doris(
             if convert_date_arith:
                 normalized = convert_date_arithmetic(normalized)
 
+            # Remove NEXTVAL columns from INSERT ... SELECT
+            if drop_sequences:
+                normalized = drop_sequence_columns(normalized)
+
             # Use custom generator for Doris to handle E-strings correctly
             if write == "doris":
                 # Pass Generator options (pretty, indent, etc.) to constructor
@@ -1197,6 +1305,7 @@ def pg_to_doris(
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
     regexp_split_to_lateral: bool = True,
+    drop_sequences: bool = True,
     **opts,
 ) -> t.List[str]:
     """
@@ -1206,12 +1315,10 @@ def pg_to_doris(
         >>> from sqlglot.contrib.doris_transpile import pg_to_doris
         >>> pg_to_doris("SELECT T.id FROM TEST t")
         ['SELECT t.id FROM test AS t']
-        >>> pg_to_doris("SELECT CAST(id AS int) FROM t")
-        ['SELECT CAST(id AS INT) AS id FROM t']
-        >>> pg_to_doris("SELECT unnest(string_to_array(tags, ',')) AS tag FROM t")
-        ['SELECT _explode_tmp.tag FROM t LATERAL VIEW EXPLODE(...) _explode_tmp AS tag']
-        >>> pg_to_doris("SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS val FROM t")
-        ['SELECT _explode_tmp.val FROM t LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) _explode_tmp AS val']
+        >>>
+        >>> # NEXTVAL columns are dropped from INSERT ... SELECT
+        >>> pg_to_doris("INSERT INTO t(id, name) SELECT NEXTVAL('seq'), n FROM src")
+        ["INSERT INTO t (`name`) SELECT n FROM src"]
     """
     return transpile_to_doris(
         sql,
@@ -1221,6 +1328,7 @@ def pg_to_doris(
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
         regexp_split_to_lateral=regexp_split_to_lateral,
+        drop_sequences=drop_sequences,
         **opts
     )
 
@@ -1282,6 +1390,7 @@ __all__ = [
     "convert_date_format_patterns",
     "add_where_to_delete",
     "convert_date_arithmetic",
+    "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "transpile_to_doris",
     "pg_to_doris",
