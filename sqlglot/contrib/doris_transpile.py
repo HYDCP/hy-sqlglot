@@ -1599,6 +1599,199 @@ def rewrite_tuple_in_subquery(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+# --------------------------------------------------------------------------- #
+# DELETE WHERE scalar-subquery -> USING (derived-table) rewrite
+# --------------------------------------------------------------------------- #
+
+# Comparison operators whose direct child Subquery we consider a "scalar
+# subquery" for the purpose of USING rewrite. IS / IS NOT technically also
+# qualify but are far less common in this migration context and bring extra
+# NULL-handling nuance; we skip them for now.
+_SCALAR_CMP_TYPES: t.Tuple[type, ...] = (
+    exp.EQ,
+    exp.NEQ,
+    exp.GT,
+    exp.LT,
+    exp.GTE,
+    exp.LTE,
+)
+
+
+def rewrite_delete_scalar_subquery(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite scalar subqueries in DELETE's WHERE clause to equivalent
+    ``DELETE ... USING (derived) ... WHERE ...`` form for Doris.
+
+    Doris does not allow subqueries directly inside DELETE's WHERE clause.
+    Starting from Doris 2.x and especially Doris 3.x the ``DELETE ... USING
+    ...`` syntax is stable, which this transform targets.
+
+    Example::
+
+        -- PG (input)
+        DELETE FROM cdm.xxx
+        WHERE BUSI_DATE = (SELECT MAX(data_dt) FROM xx.xx)
+          AND TASK_CD = 'xx'
+
+        -- Doris (output)
+        DELETE FROM cdm.xxx
+        USING (SELECT MAX(data_dt) AS _sq_val_0 FROM xx.xx) AS _sq_0
+        WHERE cdm.xxx.BUSI_DATE = _sq_0._sq_val_0
+          AND cdm.xxx.TASK_CD = 'xx'
+
+    Scope (what IS rewritten):
+        - Scalar subqueries that are the direct operand of a comparison
+          (``=`` / ``<>`` / ``>`` / ``<`` / ``>=`` / ``<=``).
+        - Multiple scalar subqueries in one DELETE: each becomes its own
+          derived table, the first as ``USING <sub>``, the rest attached
+          as cross joins on that node - which is exactly how sqlglot models
+          ``USING a, b, c``.
+
+    Scope (what is NOT rewritten, left as-is with a ``logger.warning``):
+        - DELETE that already has a USING clause (don't clobber).
+        - DELETE whose target is not a single ``exp.Table`` (multi-target
+          / DELETE against a derived table / etc.).
+        - Inner select with more than one projection (not a true scalar
+          subquery; likely malformed or an edge case).
+        - ``IN (subquery)`` / ``EXISTS (subquery)`` in the WHERE (different
+          AST shape; Doris 3.x generally handles these natively or can be
+          addressed by the IN-tuple transform).
+
+    Column qualification:
+        - After rewriting, bare columns in the WHERE tree that belong to
+          the target table are prefixed with the target's alias-or-name to
+          disambiguate from the now-visible USING columns. The comparison
+          side that was the subquery is already a fully-qualified
+          ``_sq_i._sq_val_i`` reference.
+
+    Args:
+        expression: The AST to process.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    for delete in list(expression.find_all(exp.Delete)):
+        where = delete.args.get("where")
+        if where is None:
+            continue
+
+        if delete.args.get("using") is not None:
+            # Don't touch manual USING - the user probably knows what
+            # they're doing and we'd risk double-merging derived tables.
+            continue
+
+        target_table = delete.args.get("this")
+        if not isinstance(target_table, exp.Table):
+            continue
+
+        # Collect all scalar subqueries in the WHERE subtree.
+        scalar_subs: t.List[exp.Subquery] = []
+        for sq in where.find_all(exp.Subquery):
+            parent = sq.parent
+            if isinstance(parent, _SCALAR_CMP_TYPES):
+                # Ensure this is a top-level scalar subquery, not
+                # something nested inside another subquery's WHERE
+                # (find_all goes deep).
+                if _is_within_same_where(sq, where):
+                    scalar_subs.append(sq)
+
+        if not scalar_subs:
+            continue
+
+        # Build a derived table for each scalar subquery. Each gets a
+        # unique table alias (_sq_N) and its projection gets a column
+        # alias (_sq_val_N) so the replacement reference is unambiguous.
+        derived_infos: t.List[t.Tuple[exp.Subquery, str, str]] = []
+        for i, sq in enumerate(scalar_subs):
+            inner_select = sq.this
+            if not isinstance(inner_select, exp.Select):
+                logger.warning(
+                    "DELETE WHERE 标量子查询不是 SELECT（可能是 UNION），跳过: %s",
+                    _short_sql(sq),
+                )
+                continue
+
+            select_exprs = inner_select.expressions
+            if len(select_exprs) != 1:
+                logger.warning(
+                    "DELETE WHERE 标量子查询返回 %d 列而非 1 列，跳过: %s",
+                    len(select_exprs),
+                    _short_sql(sq),
+                )
+                continue
+
+            inner_expr = select_exprs[0]
+
+            # Normalize the inner projection to an aliased form so the
+            # outer reference has a predictable column name.
+            col_alias_name = f"_sq_val_{i}"
+            if isinstance(inner_expr, exp.Alias):
+                # Respect user-provided alias; use it as the column name.
+                col_alias_name = inner_expr.alias
+                aliased_expr = inner_expr.copy()
+            else:
+                aliased_expr = exp.alias_(inner_expr.copy(), col_alias_name)
+
+            sub_alias_name = f"_sq_{i}"
+
+            new_inner_select = inner_select.copy()
+            new_inner_select.set("expressions", [aliased_expr])
+            derived = exp.Subquery(
+                this=new_inner_select,
+                alias=exp.TableAlias(this=exp.to_identifier(sub_alias_name)),
+            )
+
+            # Swap the original subquery node with a column reference into
+            # the derived table.
+            sq.replace(
+                exp.Column(
+                    this=exp.to_identifier(col_alias_name),
+                    table=exp.to_identifier(sub_alias_name),
+                )
+            )
+
+            derived_infos.append((derived, sub_alias_name, col_alias_name))
+
+        if not derived_infos:
+            continue
+
+        # Attach derived tables as USING. sqlglot models ``USING a, b, c``
+        # as ``using=a`` with ``joins=[Join(b), Join(c)]`` hanging off a.
+        first_derived = derived_infos[0][0]
+        if len(derived_infos) > 1:
+            extra_joins = [exp.Join(this=d[0]) for d in derived_infos[1:]]
+            existing_joins = first_derived.args.get("joins") or []
+            first_derived.set("joins", list(existing_joins) + extra_joins)
+        delete.set("using", first_derived)
+
+        # Qualify any remaining bare columns in the WHERE tree with the
+        # target table's alias-or-name so they're not ambiguous now that
+        # the derived tables are in scope.
+        target_ref = target_table.alias_or_name
+        if target_ref:
+            for col in where.find_all(exp.Column):
+                if col.args.get("table"):
+                    continue
+                col.set("table", exp.to_identifier(target_ref))
+
+    return expression
+
+
+def _is_within_same_where(node: exp.Expression, where: exp.Where) -> bool:
+    """
+    Return True iff ``node`` is the directly owning ``where``'s descendant,
+    i.e. not nested inside another Select/Subquery that reintroduces its
+    own WHERE context. We walk up from ``node`` until we hit ``where`` or
+    an intervening Select.
+    """
+    cur: t.Optional[exp.Expression] = node.parent
+    while cur is not None and cur is not where:
+        if isinstance(cur, exp.Select):
+            return False
+        cur = cur.parent
+    return cur is where
+
+
 def _find_outer_table_ref(in_node: exp.Expression) -> t.Optional[str]:
     """
     Walk up from an ``In`` node to the nearest enclosing statement and return
@@ -1845,6 +2038,7 @@ def transpile_to_doris(
     convert_compound_interval: bool = True,
     normalize_date_trunc: bool = True,
     convert_tuple_in_subquery: bool = True,
+    convert_delete_scalar_subquery: bool = True,
     preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
@@ -1909,6 +2103,15 @@ def transpile_to_doris(
             - Only simple subqueries are rewritten (single-table FROM, no
               GROUP BY/HAVING/DISTINCT/QUALIFY/WITH/LIMIT/OFFSET/ORDER/UNION)
             - See docs/MULTI_COLUMN_IN_SUBQUERY.md for the full rationale
+        convert_delete_scalar_subquery: Whether to rewrite scalar subqueries in
+            DELETE's WHERE clause to ``DELETE ... USING (derived) ...`` form
+            (default True; requires Doris 2.0+, verified against Doris 3.x)
+            - Doris does not allow subqueries inside DELETE's WHERE clause
+            - Only scalar subqueries attached to comparison operators
+              (=, <>, >, <, >=, <=) are rewritten; IN/EXISTS are handled by
+              other transforms or left as-is
+            - DELETE with a manually-written USING is left untouched
+            - See docs/DELETE_SUBQUERY_DORIS.md for the full rationale
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -2016,6 +2219,12 @@ def transpile_to_doris(
             # alone with a warning (NULL semantics differ).
             if convert_tuple_in_subquery:
                 normalized = rewrite_tuple_in_subquery(normalized)
+
+            # Rewrite scalar subqueries in DELETE WHERE to USING (derived)
+            # form. Doris 2.x/3.x supports DELETE ... USING ... but not
+            # subqueries directly inside WHERE.
+            if convert_delete_scalar_subquery:
+                normalized = rewrite_delete_scalar_subquery(normalized)
 
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
@@ -2135,6 +2344,7 @@ __all__ = [
     "expand_compound_interval",
     "normalize_date_trunc_unit",
     "rewrite_tuple_in_subquery",
+    "rewrite_delete_scalar_subquery",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_negative_interval",
