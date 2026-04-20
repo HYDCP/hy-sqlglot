@@ -53,16 +53,118 @@ class IdentifierNormalizeMode:
 
 class DorisTranspileGenerator(Doris.Generator):
     """
-    Custom Doris Generator that correctly handles PostgreSQL E-strings.
+    Custom Doris Generator that correctly handles PostgreSQL E-strings and
+    preserves single-line ``--`` comments containing ``/* ... */`` segments.
 
     PostgreSQL E-strings (E'...') are parsed by SQLGlot as ByteString nodes.
     The default Doris generator doesn't handle ByteString properly, losing quotes
     and not handling escape sequences correctly.
 
-    This custom generator overrides bytestring_sql() to:
-    1. Convert ByteString to proper quoted string literals
-    2. Adjust backslash escaping for regex patterns
+    This custom generator overrides:
+    1. ``bytestring_sql()``: convert ByteString to proper quoted string literals
+       with adjusted backslash escaping for regex patterns.
+    2. ``maybe_comment()`` / ``connector_sql()``: when a comment body contains
+       ``*/`` (typically because the source SQL had ``-- ... /*xxx*/``), emit
+       a ``-- ...\\n`` single-line comment instead of wrapping it as
+       ``/* ... */``. Doris (like MySQL) does not support nested block
+       comments, so the default ``/*...*/`` wrapping would otherwise close
+       the outer block at the inner ``*/`` and produce invalid SQL.
+       The original ``-`` count (``--``, ``---``, ``----`` ...) is preserved
+       byte-for-byte.
     """
+
+    # ------------------------------------------------------------------ #
+    # ADB(PostgreSQL) -> Doris specific: preserve "-- ... /*xxx*/"
+    # ------------------------------------------------------------------ #
+
+    def _format_doris_comment(self, comment: str) -> str:
+        """
+        Render a single comment safely for Doris.
+
+        Default behavior: wrap with ``/* ... */`` (same as upstream).
+
+        Special case: if the comment body already contains ``*/``, the source
+        was almost certainly a single-line ``-- ... /* ... */`` comment whose
+        delimiter was discarded by the tokenizer. Wrapping it in ``/* ... */``
+        would create an illegal nested block comment in Doris. We instead
+        emit ``-- body\\n`` so the original character form is preserved.
+
+        Surplus leading ``-`` characters (from ``---``, ``----``, ...) are
+        kept inside the comment body by sqlglot's tokenizer; we concatenate
+        them directly to ``--`` to faithfully reproduce the original prefix
+        (e.g. body ``"- foo"`` becomes ``"--- foo"``, never ``"-- - foo"``).
+        A single space is inserted only when the body starts with a character
+        that would otherwise be glued onto ``--`` and break MySQL/Doris's
+        single-line-comment recognition rule (which requires whitespace after
+        ``--``).
+        """
+        if "*/" in comment:
+            sep = "" if comment[:1] in ("-", " ", "\t", "\n", "\r") else " "
+            return f"--{sep}{comment}\n"
+        return f"/*{self.pad_comment(comment)}*/"
+
+    def maybe_comment(
+        self,
+        sql: str,
+        expression: t.Optional[exp.Expression] = None,
+        comments: t.Optional[t.List[str]] = None,
+        separated: bool = False,
+    ) -> str:
+        # Mirror upstream Generator.maybe_comment, but route each comment
+        # through _format_doris_comment so '*/'-containing bodies fall back
+        # to '-- ...\n'.
+        comments = (
+            ((expression and expression.comments) if comments is None else comments)  # type: ignore
+            if self.comments
+            else None
+        )
+
+        if not comments or isinstance(expression, self.EXCLUDE_COMMENTS):
+            return sql
+
+        comments_sql = " ".join(
+            self._format_doris_comment(comment) for comment in comments if comment
+        )
+
+        if not comments_sql:
+            return sql
+
+        comments_sql = self._replace_line_breaks(comments_sql)
+
+        if separated or isinstance(expression, self.WITH_SEPARATED_COMMENTS):
+            return (
+                f"{self.sep()}{comments_sql}{sql}"
+                if not sql or sql[0].isspace()
+                else f"{comments_sql}{self.sep()}{sql}"
+            )
+
+        return f"{sql} {comments_sql}"
+
+    def connector_sql(
+        self,
+        expression: exp.Connector,
+        op: str,
+        stack: t.Optional[t.List[t.Any]] = None,
+    ) -> str:
+        # Mirror upstream Generator.connector_sql but route the comment
+        # attached to AND/OR through _format_doris_comment so '*/' inside a
+        # single-line comment does not produce nested block comments.
+        if stack is not None:
+            if expression.expressions:
+                stack.append(self.expressions(expression, sep=f" {op} "))
+            else:
+                stack.append(expression.right)
+                if expression.comments and self.comments:
+                    for comment in expression.comments:
+                        if comment:
+                            op += f" {self._format_doris_comment(comment)}"
+                stack.extend((op, expression.left))
+            return op
+
+        # For the non-stack path, defer to upstream implementation. Comments
+        # attached at the boolean operator level only flow through the
+        # stack-based branch above in current sqlglot, so this is fine.
+        return super().connector_sql(expression, op, stack)
 
     def bytestring_sql(self, expression: exp.ByteString) -> str:
         """
