@@ -1330,6 +1330,63 @@ def expand_compound_interval(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+# --------------------------------------------------------------------------- #
+# DATE_TRUNC unit normalization (PG plural -> Doris singular)
+# --------------------------------------------------------------------------- #
+
+# Doris officially supports only these singular unit names for DATE_TRUNC
+# (https://doris.apache.org/docs/dev/sql-manual/sql-functions/scalar-functions/
+#  date-time-functions/date-trunc). PG additionally accepts the plural forms
+# ('months', 'days', ...). We only strip a trailing ``S`` when the singular
+# form lands in this whitelist, so unknown user-supplied units (e.g. an
+# unrelated typo) are left alone.
+_DATE_TRUNC_UNIT_SINGULARS = {
+    "YEAR",
+    "QUARTER",
+    "MONTH",
+    "WEEK",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+}
+
+
+def normalize_date_trunc_unit(expression: exp.Expression) -> exp.Expression:
+    """
+    Normalize DATE_TRUNC unit names to Doris-accepted singular forms.
+
+    PostgreSQL's ``date_trunc`` accepts plural unit names (e.g. ``'months'``,
+    ``'days'``). Doris' ``DATE_TRUNC`` documents and enforces a strict
+    singular-only whitelist
+    (``year|quarter|month|week|day|hour|minute|second``) and raises an error
+    on anything else. This transform strips the trailing ``S`` from the
+    second-argument unit when (and only when) the resulting singular is in
+    that whitelist.
+
+    Examples:
+        DATE_TRUNC(x, 'MONTHS')   -> DATE_TRUNC(x, 'MONTH')
+        DATE_TRUNC(x, 'DAYS')     -> DATE_TRUNC(x, 'DAY')
+        DATE_TRUNC(x, 'QUARTERS') -> DATE_TRUNC(x, 'QUARTER')
+        DATE_TRUNC(x, 'MONTH')    -> unchanged
+        DATE_TRUNC(x, 'fortnights') -> unchanged (not in whitelist)
+
+    Args:
+        expression: The AST to process.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    for node in expression.find_all(exp.DateTrunc, exp.TimestampTrunc):
+        unit = node.args.get("unit")
+        if not isinstance(unit, exp.Var):
+            continue
+        name = unit.name.upper()
+        if len(name) > 1 and name.endswith("S") and name[:-1] in _DATE_TRUNC_UNIT_SINGULARS:
+            unit.set("this", name[:-1])
+    return expression
+
+
 def _is_date_expression(node: exp.Expression) -> bool:
     """
     Check if an expression is a date-type expression.
@@ -1521,6 +1578,7 @@ def transpile_to_doris(
     auto_add_delete_where: bool = True,
     convert_date_arith: bool = True,
     convert_compound_interval: bool = True,
+    normalize_date_trunc: bool = True,
     preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
@@ -1573,6 +1631,10 @@ def transpile_to_doris(
             - X - INTERVAL '1 month -1 day' -> X - INTERVAL 1 MONTH + INTERVAL 1 DAY
               (outer sign is multiplied into every segment, matching PG semantics)
             - Also normalizes single-unit plural forms: INTERVAL '5 days' -> INTERVAL 5 DAY
+        normalize_date_trunc: Whether to normalize DATE_TRUNC unit names to Doris-accepted
+            singular forms (default True)
+            - Doris only accepts year|quarter|month|week|day|hour|minute|second
+            - PG accepts plurals: DATE_TRUNC('months', x) -> DATE_TRUNC(x, 'MONTH')
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -1669,6 +1731,11 @@ def transpile_to_doris(
             # INTERVAL nodes that this transform must leave untouched.
             if convert_compound_interval:
                 normalized = expand_compound_interval(normalized)
+
+            # Normalize DATE_TRUNC unit names to Doris singular forms
+            # (PG accepts plurals like 'months'/'days'; Doris does not).
+            if normalize_date_trunc:
+                normalized = normalize_date_trunc_unit(normalized)
 
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
@@ -1786,6 +1853,7 @@ __all__ = [
     "add_where_to_delete",
     "convert_date_arithmetic",
     "expand_compound_interval",
+    "normalize_date_trunc_unit",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_negative_interval",
