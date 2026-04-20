@@ -21,6 +21,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import re
 import typing as t
 
@@ -28,6 +29,8 @@ from sqlglot import exp, parse
 from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
 from sqlglot.dialects.doris import Doris
 from sqlglot.dialects.postgres import Postgres
+
+logger = logging.getLogger(__name__)
 from sqlglot.errors import ErrorLevel
 
 if t.TYPE_CHECKING:
@@ -1387,6 +1390,268 @@ def normalize_date_trunc_unit(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+# --------------------------------------------------------------------------- #
+# Multi-column (tuple) IN (subquery) -> EXISTS rewrite
+# --------------------------------------------------------------------------- #
+
+# Subquery clauses that make a naive "AND correlation into existing WHERE"
+# rewrite semantically unsafe (e.g. GROUP BY happens before WHERE, so pushing
+# an outer-correlated predicate into the WHERE would shrink the groups before
+# aggregation). When any of these show up we leave the IN alone and warn.
+_TUPLE_IN_UNSAFE_CLAUSES = (
+    "group",
+    "having",
+    "distinct",
+    "qualify",
+    "with",
+    "offset",
+    "limit",
+    "order",
+)
+
+
+def rewrite_tuple_in_subquery(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite multi-column ``(a, b) IN (SELECT x, y FROM t ...)`` to
+    ``EXISTS (SELECT 1 FROM t ... WHERE t.x = a AND t.y = b)`` for Doris.
+
+    Doris does not support the SQL-standard row-constructor IN-subquery
+    syntax. The equivalent EXISTS form runs in Doris and executes as a
+    SEMI JOIN with comparable performance.
+
+    Scope (what IS rewritten):
+        - Positive ``(tuple) IN (subquery)`` where the subquery is a plain
+          ``SELECT expr_list FROM single_table [WHERE ...]``.
+        - Tuple arity must match subquery projection arity.
+
+    Scope (what is NOT rewritten, left as-is with a ``logger.warning`` so
+    the user notices during migration):
+        - ``NOT IN`` (``In.parent`` is ``exp.Not``). Converting ``NOT IN``
+          to ``NOT EXISTS`` silently changes result sets when the subquery
+          projection contains NULL rows - see
+          ``docs/MULTI_COLUMN_IN_SUBQUERY.md`` section 4.
+        - Subquery with GROUP BY / HAVING / DISTINCT / QUALIFY / WITH /
+          LIMIT / OFFSET / ORDER or that is a UNION. These need a nested
+          wrapping SELECT to preserve semantics; we defer that complexity.
+        - Subqueries with joined FROMs (multiple tables). Determining the
+          right table prefix for each projection column is non-trivial
+          and we do not want to silently misassign.
+        - Tuple arity mismatch with subquery arity (malformed SQL).
+
+    Column qualification:
+        - The inner projection and the outer tuple must BOTH be qualified,
+          otherwise the EXISTS scoping silently collapses to tautology.
+          Concretely, inside ``EXISTS (SELECT 1 FROM bl WHERE ... = cust_id)``
+          the bare ``cust_id`` would resolve to ``bl.cust_id`` first
+          (inner-then-outer scope), yielding ``bl.cust_id = bl.cust_id``
+          - always true - which would make UPDATE/DELETE hit every row.
+        - Inner bare ``Column`` is prefixed with the subquery's single FROM
+          table alias/name.
+        - Outer bare ``Column`` is prefixed with the enclosing query's
+          primary table alias/name (discovered by walking up the AST to
+          the nearest UPDATE/DELETE/SELECT with a single-table FROM).
+          If the outer query has a multi-table FROM (JOIN) we cannot
+          safely pick a single prefix and therefore SKIP the rewrite with
+          a warning - the user should qualify the tuple explicitly.
+
+    Args:
+        expression: The AST to process.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    for in_node in list(expression.find_all(exp.In)):
+        tuple_node = in_node.this
+        query_node = in_node.args.get("query")
+
+        if not isinstance(tuple_node, exp.Tuple):
+            continue
+        if not isinstance(query_node, exp.Subquery):
+            continue
+
+        # NOT IN: leave untouched. The NULL semantics of NOT IN and
+        # NOT EXISTS diverge when the subquery projection can produce NULL,
+        # and silently flipping produced SQL is a migration hazard.
+        if isinstance(in_node.parent, exp.Not):
+            logger.warning(
+                "Doris 不支持多列 NOT IN (subquery) 且其 NULL 语义与 NOT EXISTS "
+                "不等价，保留原样请手工改写: %s",
+                _short_sql(in_node),
+            )
+            continue
+
+        select = query_node.this
+        if not isinstance(select, exp.Select):
+            logger.warning(
+                "多列 IN 子查询不是普通 SELECT（如 UNION），保留原样: %s",
+                _short_sql(in_node),
+            )
+            continue
+
+        # Any subquery clause that can change the grouping / ordering /
+        # cardinality of the inner result set cannot be handled by a naive
+        # "AND the correlation into the WHERE" rewrite.
+        if any(select.args.get(k) for k in _TUPLE_IN_UNSAFE_CLAUSES):
+            logger.warning(
+                "多列 IN 子查询含 GROUP BY/HAVING/DISTINCT/LIMIT/ORDER 等子句，"
+                "自动转换可能改变语义，保留原样: %s",
+                _short_sql(in_node),
+            )
+            continue
+
+        from_clause = select.args.get("from")
+        if from_clause is None:
+            # No FROM means nothing sensible to correlate against.
+            continue
+        if select.args.get("joins"):
+            # Multi-table FROM: deciding which side each projection column
+            # belongs to requires real scope analysis. Skip conservatively.
+            logger.warning(
+                "多列 IN 子查询带 JOIN 的 FROM，自动改写列归属不可靠，保留原样: %s",
+                _short_sql(in_node),
+            )
+            continue
+
+        inner_from = from_clause.this
+        if not isinstance(inner_from, exp.Table):
+            # e.g. FROM (subquery) alias - skip to stay safe.
+            continue
+        inner_table_ref = inner_from.alias_or_name
+
+        tuple_exprs = tuple_node.expressions
+        select_exprs = [e.unalias() for e in select.expressions]
+
+        if len(tuple_exprs) != len(select_exprs):
+            logger.warning(
+                "多列 IN 元数与子查询列数不等（%d vs %d），保留原样: %s",
+                len(tuple_exprs),
+                len(select_exprs),
+                _short_sql(in_node),
+            )
+            continue
+
+        # Discover the outer query's primary table so we can qualify bare
+        # columns in the tuple. EXISTS scoping resolves bare names to the
+        # inner FROM first, so leaving them unqualified here would silently
+        # produce ``inner.x = inner.x`` tautologies.
+        outer_table_ref = _find_outer_table_ref(in_node)
+
+        # Any bare column in the tuple means we need the outer prefix; if
+        # we cannot derive one safely, bail out rather than produce a
+        # subtly-wrong rewrite.
+        has_bare_outer_col = any(
+            isinstance(expr, exp.Column) and not expr.args.get("table")
+            for expr in tuple_exprs
+        )
+        if has_bare_outer_col and outer_table_ref is None:
+            logger.warning(
+                "多列 IN 外层 tuple 含无前缀列且外层主表不可推断（多表 JOIN 或嵌套子查询）。"
+                "自动改写会让 EXISTS 作用域退化为恒真，保留原样请手工加表前缀: %s",
+                _short_sql(in_node),
+            )
+            continue
+
+        # Build the AND-chain of correlation predicates. Each predicate is
+        # inner_col = outer_col; both sides get their missing table prefix
+        # filled in to avoid the inner-scope tautology trap.
+        pairs: t.List[exp.Expression] = []
+        for inner_expr, outer_expr in zip(select_exprs, tuple_exprs):
+            inner_copy = inner_expr.copy()
+            if (
+                isinstance(inner_copy, exp.Column)
+                and not inner_copy.args.get("table")
+                and inner_table_ref
+            ):
+                inner_copy.set("table", exp.to_identifier(inner_table_ref))
+
+            outer_copy = outer_expr.copy()
+            if (
+                isinstance(outer_copy, exp.Column)
+                and not outer_copy.args.get("table")
+                and outer_table_ref
+            ):
+                outer_copy.set("table", exp.to_identifier(outer_table_ref))
+
+            pairs.append(exp.EQ(this=inner_copy, expression=outer_copy))
+
+        correlation: exp.Expression = pairs[0]
+        for pred in pairs[1:]:
+            correlation = exp.And(this=correlation, expression=pred)
+
+        # Clone the original SELECT so we retain FROM / WHERE / etc. intact,
+        # then swap projection to ``SELECT 1`` and AND the correlation into
+        # whatever WHERE already existed.
+        new_select = select.copy()
+        new_select.set("expressions", [exp.Literal.number(1)])
+
+        existing_where = new_select.args.get("where")
+        if existing_where is not None:
+            merged = exp.And(
+                this=existing_where.this.copy(),
+                expression=correlation,
+            )
+        else:
+            merged = correlation
+        new_select.set("where", exp.Where(this=merged))
+
+        in_node.replace(exp.Exists(this=new_select))
+
+    return expression
+
+
+def _find_outer_table_ref(in_node: exp.Expression) -> t.Optional[str]:
+    """
+    Walk up from an ``In`` node to the nearest enclosing statement and return
+    the single-table FROM/target's alias-or-name, or None if the enclosing
+    query has a multi-table FROM / joined FROM / subquery FROM / no FROM.
+
+    Used to qualify bare outer-tuple columns when rewriting
+    ``(col) IN (SELECT ...)`` as ``EXISTS (... WHERE inner = outer)``.
+
+    Traversal rules:
+        - Stop at the first ``Update``/``Delete``/``Select`` ancestor that
+          has an identifiable target/FROM.
+        - If that statement's target is a single ``exp.Table`` with no
+          JOINs, return its alias-or-name.
+        - Otherwise return None (caller is expected to bail out).
+    """
+    node: t.Optional[exp.Expression] = in_node.parent
+    while node is not None:
+        if isinstance(node, exp.Update):
+            tgt = node.args.get("this")
+            if isinstance(tgt, exp.Table):
+                return tgt.alias_or_name
+            return None
+        if isinstance(node, exp.Delete):
+            tgt = node.args.get("this")
+            if isinstance(tgt, exp.Table):
+                return tgt.alias_or_name
+            return None
+        if isinstance(node, exp.Select):
+            from_clause = node.args.get("from")
+            if from_clause is None:
+                return None
+            if node.args.get("joins"):
+                return None
+            first = from_clause.this
+            if isinstance(first, exp.Table):
+                return first.alias_or_name
+            return None
+        node = node.parent
+    return None
+
+
+def _short_sql(node: exp.Expression, limit: int = 160) -> str:
+    """Best-effort short SQL rendering for log messages."""
+    try:
+        text = node.sql()
+    except Exception:  # pragma: no cover - log path must never raise
+        return repr(node)[:limit]
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
 def _is_date_expression(node: exp.Expression) -> bool:
     """
     Check if an expression is a date-type expression.
@@ -1579,6 +1844,7 @@ def transpile_to_doris(
     convert_date_arith: bool = True,
     convert_compound_interval: bool = True,
     normalize_date_trunc: bool = True,
+    convert_tuple_in_subquery: bool = True,
     preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
@@ -1635,6 +1901,14 @@ def transpile_to_doris(
             singular forms (default True)
             - Doris only accepts year|quarter|month|week|day|hour|minute|second
             - PG accepts plurals: DATE_TRUNC('months', x) -> DATE_TRUNC(x, 'MONTH')
+        convert_tuple_in_subquery: Whether to rewrite multi-column ``(tuple) IN (subquery)``
+            to an equivalent ``EXISTS (correlated subquery)`` (default True)
+            - Doris does not support the SQL-standard row-constructor IN-subquery
+            - Only the positive form is rewritten; NOT IN is left as-is with a
+              logged warning because NOT IN / NOT EXISTS NULL semantics differ
+            - Only simple subqueries are rewritten (single-table FROM, no
+              GROUP BY/HAVING/DISTINCT/QUALIFY/WITH/LIMIT/OFFSET/ORDER/UNION)
+            - See docs/MULTI_COLUMN_IN_SUBQUERY.md for the full rationale
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -1736,6 +2010,12 @@ def transpile_to_doris(
             # (PG accepts plurals like 'months'/'days'; Doris does not).
             if normalize_date_trunc:
                 normalized = normalize_date_trunc_unit(normalized)
+
+            # Rewrite multi-column (tuple) IN (subquery) to EXISTS; Doris
+            # doesn't support the row-constructor IN form. NOT IN is left
+            # alone with a warning (NULL semantics differ).
+            if convert_tuple_in_subquery:
+                normalized = rewrite_tuple_in_subquery(normalized)
 
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
@@ -1854,6 +2134,7 @@ __all__ = [
     "convert_date_arithmetic",
     "expand_compound_interval",
     "normalize_date_trunc_unit",
+    "rewrite_tuple_in_subquery",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_negative_interval",
