@@ -71,7 +71,45 @@ class DorisTranspileGenerator(Doris.Generator):
        the outer block at the inner ``*/`` and produce invalid SQL.
        The original ``-`` count (``--``, ``---``, ``----`` ...) is preserved
        byte-for-byte.
+    3. ``ordered_sql()``: optionally suppress the ``CASE WHEN x IS NULL ...``
+       sort key that sqlglot adds to mimic PostgreSQL's default NULL ordering
+       (PG: ASC NULLS LAST / DESC NULLS FIRST; Doris: opposite). Controlled
+       by the ``preserve_pg_null_order`` constructor flag (default False ==
+       use Doris' native NULL ordering, no rewriting).
     """
+
+    def __init__(self, *args: t.Any, preserve_pg_null_order: bool = False,
+                 **kwargs: t.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._preserve_pg_null_order = preserve_pg_null_order
+
+    def ordered_sql(self, expression: exp.Ordered) -> str:
+        """
+        Render an ORDER BY item.
+
+        When ``preserve_pg_null_order`` is False (the default for this
+        transpiler), the output uses Doris' native NULL ordering convention
+        (ASC NULLS FIRST, DESC NULLS LAST). All PG-derived NULL position
+        information is discarded so that:
+          * no synthetic ``CASE WHEN x IS NULL THEN 1 ELSE 0 END`` sort key
+            is added (which sqlglot upstream emits for unsupported NULL
+            ordering);
+          * no ``NULLS FIRST`` / ``NULLS LAST`` keyword is emitted either.
+
+        When ``preserve_pg_null_order`` is True, we delegate to the upstream
+        implementation so the PG semantics are faithfully preserved via the
+        CASE WHEN trick. Use this when downstream queries rely on the exact
+        NULL position produced by PostgreSQL.
+        """
+        if self._preserve_pg_null_order:
+            return super().ordered_sql(expression)
+
+        this = self.sql(expression, "this")
+        desc = expression.args.get("desc")
+        sort_order = " DESC" if desc else (" ASC" if desc is False else "")
+        with_fill = self.sql(expression, "with_fill")
+        with_fill = f" {with_fill}" if with_fill else ""
+        return f"{this}{sort_order}{with_fill}"
 
     # ------------------------------------------------------------------ #
     # ADB(PostgreSQL) -> Doris specific: preserve "-- ... /*xxx*/"
@@ -1134,6 +1172,164 @@ def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+# --------------------------------------------------------------------------- #
+# Compound INTERVAL expansion (PostgreSQL → Doris)
+# --------------------------------------------------------------------------- #
+
+# Matches one ``<sign?><digits><spaces><word>`` segment inside a PostgreSQL
+# compound interval literal such as ``'1 month -1 day'`` or ``'1 year 2 months'``.
+_COMPOUND_INTERVAL_RE = re.compile(r"([+-]?\d+)\s*([A-Za-z]+)")
+
+
+def _parse_compound_interval(s: str) -> t.List[t.Tuple[int, str]]:
+    """
+    Parse a PostgreSQL compound interval literal into ``(value, UNIT)`` pairs.
+
+    Plural unit names (``DAYS``, ``MONTHS`` ...) are normalized to their
+    singular form because Doris/MySQL only accept the singular keyword.
+
+    Examples:
+        '1 month -1 day'        -> [(1, 'MONTH'), (-1, 'DAY')]
+        '1 year 2 months'       -> [(1, 'YEAR'), (2, 'MONTH')]
+        '5 days'                -> [(5, 'DAY')]
+        ''                      -> []
+    """
+    out: t.List[t.Tuple[int, str]] = []
+    for n_str, unit in _COMPOUND_INTERVAL_RE.findall(s):
+        u = unit.upper()
+        # MONTHS -> MONTH, DAYS -> DAY, HOURS -> HOUR, etc.
+        # Keep MS/US-style abbreviations (no trailing S to strip) unchanged.
+        if len(u) > 1 and u.endswith("S"):
+            u = u[:-1]
+        out.append((int(n_str), u))
+    return out
+
+
+def expand_compound_interval(expression: exp.Expression) -> exp.Expression:
+    """
+    Expand PostgreSQL compound INTERVAL literals into single-unit INTERVALs.
+
+    PostgreSQL supports compound interval literals like ``INTERVAL '1 month -1 day'``,
+    but Doris/MySQL only accept the single-unit form ``INTERVAL n UNIT``. This
+    transform rewrites the surrounding ``+/-`` chain so that each unit becomes
+    its own ``INTERVAL`` operand.
+
+    Rules:
+        - Single-unit literal (compound parse yields exactly one segment):
+          rewrite in place. ``INTERVAL '5 days'`` becomes ``INTERVAL 5 DAY``.
+        - Multi-unit literal: the parent expression must be ``Add`` or ``Sub``.
+          The outer sign is multiplied into every segment (PostgreSQL semantics
+          for ``X - INTERVAL '1 month -1 day'`` is ``X - 1 month + 1 day``).
+          The chain is then rebuilt as ``base ± INTERVAL n1 U1 ± INTERVAL n2 U2 ...``.
+        - Multi-unit literal whose parent is not ``Add``/``Sub`` (rare; e.g.
+          ``SELECT INTERVAL '1 day -1 hour'``): left unchanged. Doris will
+          report an error at execution time, which is preferable to silently
+          producing an arithmetically different expression.
+
+    Examples:
+        SELECT t + INTERVAL '1 month -1 day'
+            -> SELECT t + INTERVAL 1 MONTH - INTERVAL 1 DAY
+
+        SELECT t - INTERVAL '1 month -1 day'
+            -> SELECT t - INTERVAL 1 MONTH + INTERVAL 1 DAY
+
+        SELECT t + INTERVAL '5 days'
+            -> SELECT t + INTERVAL 5 DAY
+
+    Args:
+        expression: The AST to process.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    # ---- Pass 1: numeric-string -> bare-number normalization for single-unit ----
+    # Done before compound expansion so that any node duplicated via
+    # ``base.copy()`` in Pass 2 already carries the normalized literal.
+    #
+    # ``interval.unit`` may be one of:
+    #   - a real ``exp.Var`` node  -> single-unit interval, structurally fine
+    #   - ``None``                  -> no unit attached
+    #   - ``False``                 -> sqlglot uses the literal ``False`` in
+    #                                  some code paths (observed when an
+    #                                  ORDER BY appears in the same SELECT)
+    # Both ``None`` and ``False`` are non-truthy and mean "needs expansion",
+    # so a truthy check is safer than ``is not None`` here.
+    for interval in expression.find_all(exp.Interval):
+        if not interval.unit:
+            continue
+        lit = interval.this
+        if (
+            isinstance(lit, exp.Literal)
+            and lit.is_string
+            and lit.this.lstrip("+-").isdigit()
+        ):
+            interval.set("this", exp.Literal.number(int(lit.this)))
+
+    # ---- Pass 2: expand compound INTERVAL literals ----
+    for interval in list(expression.find_all(exp.Interval)):
+        if interval.unit:
+            continue  # already handled by Pass 1
+
+        lit = interval.this
+        if not isinstance(lit, exp.Literal) or not lit.is_string:
+            continue
+
+        parts = _parse_compound_interval(lit.this)
+        if not parts:
+            continue
+
+        # Single segment: rewrite in place. Covers '5 days' -> 5 DAY.
+        if len(parts) == 1:
+            n, u = parts[0]
+            interval.set("this", exp.Literal.number(n))
+            interval.set("unit", exp.Var(this=u))
+            continue
+
+        # Multiple segments: need a host Add/Sub to attach the chain.
+        parent = interval.parent
+        if not isinstance(parent, (exp.Add, exp.Sub)):
+            # Isolated compound interval (e.g. SELECT INTERVAL '1 day -1 hour').
+            # No safe rewrite possible; leave it for Doris to error on.
+            continue
+
+        # The INTERVAL must be the RIGHT operand of an Add/Sub (i.e.
+        # ``<date_expr> +/- INTERVAL '...'``). If it sits on the LEFT
+        # (``INTERVAL '...' +/- <date_expr>``), we can't safely rewrite:
+        #   * ``INTERVAL ... - X`` is meaningless in PG (interval minus
+        #     timestamp), so we don't touch it.
+        #   * ``INTERVAL ... + X`` is technically commutative for date+interval
+        #     but the rewrite shape we use (``X + INTERVAL ... - INTERVAL ...``)
+        #     would silently change the operand order, which we choose not to
+        #     do without an explicit need from a real-world query.
+        # Leave such cases unchanged so Doris reports the syntax error
+        # explicitly rather than running a semantically different statement.
+        if interval is not parent.expression:
+            continue
+
+        outer_sign = 1 if isinstance(parent, exp.Add) else -1
+        base = parent.this  # the date/time expression on the LHS
+
+        def _make_iv(n: int, u: str) -> exp.Interval:
+            return exp.Interval(
+                this=exp.Literal.number(abs(n)),
+                unit=exp.Var(this=u),
+            )
+
+        n0, u0 = parts[0]
+        n0 *= outer_sign
+        chain: exp.Expression = (exp.Add if n0 >= 0 else exp.Sub)(
+            this=base.copy(), expression=_make_iv(n0, u0)
+        )
+        for n, u in parts[1:]:
+            n *= outer_sign
+            cls = exp.Add if n >= 0 else exp.Sub
+            chain = cls(this=chain, expression=_make_iv(n, u))
+
+        parent.replace(chain)
+
+    return expression
+
+
 def _is_date_expression(node: exp.Expression) -> bool:
     """
     Check if an expression is a date-type expression.
@@ -1175,6 +1371,70 @@ def _is_date_expression(node: exp.Expression) -> bool:
         return True
 
     return False
+
+
+# Alternation tokenizer: each match is one of
+#   - a single-quoted SQL string (with '' escapes)
+#   - a -- line comment
+#   - a /* ... */ block comment
+#   - the rewrite-target single-segment INTERVAL literal
+# The first three are kept verbatim so that we never touch text inside string
+# literals or comments; only the last one is rewritten.
+_INTERVAL_PREPROCESS_RE = re.compile(
+    r"""
+    (                                       # group 1: keep verbatim
+        '(?:[^']|'')*'                      #   quoted string, '' escapes allowed
+      | --[^\n]*                            #   line comment to end-of-line
+      | /\*[\s\S]*?\*/                      #   block comment (non-greedy)
+    )
+    |                                       # OR
+    \b(INTERVAL)\s*                         # group 2: INTERVAL keyword
+    '\s*([+-]?\d+)\s*([A-Za-z]+)\s*'        # groups 3,4: <sign?><n>, <unit>
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+def preprocess_negative_interval(sql: str) -> str:
+    """
+    Lift the unit out of single-segment INTERVAL literals so the sign is
+    preserved by sqlglot's PostgreSQL parser.
+
+    PostgreSQL's parser in sqlglot has a quirk: when the unit is embedded
+    inside the literal, the sign is silently dropped. For example:
+
+        INTERVAL '-5 days'   ->  Interval(this='5',  unit=DAYS)   # sign LOST
+        INTERVAL '-5' DAY    ->  Interval(this='-5', unit=DAY)    # sign kept
+
+    This preprocessor converts the former into the latter (only for
+    *single-segment* literals; compound literals like '1 month -1 day' do not
+    match and continue to flow through ``expand_compound_interval``).
+
+    String literals and SQL comments are skipped, so text like
+    ``'INTERVAL ''5 days'''`` or ``-- INTERVAL '5 days' is bad`` is left alone.
+
+    Examples:
+        INTERVAL '-5 days'  -> INTERVAL '-5' DAY
+        INTERVAL '+1 month' -> INTERVAL '+1' MONTH
+        INTERVAL '5 day'    -> INTERVAL '5' DAY    (idempotent in semantics)
+
+    Args:
+        sql: The raw SQL string to preprocess.
+
+    Returns:
+        The preprocessed SQL string.
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        # Group 1 = string literal or comment: keep as-is.
+        if m.group(1) is not None:
+            return m.group(0)
+        # Group 2..4 = INTERVAL '<sign?>n unit': rewrite.
+        keyword, n, unit = m.group(2), m.group(3), m.group(4).upper()
+        if len(unit) > 1 and unit.endswith("S"):
+            unit = unit[:-1]
+        return f"{keyword} '{n}' {unit}"
+
+    return _INTERVAL_PREPROCESS_RE.sub(_sub, sql)
 
 
 def preprocess_date_cast_syntax(sql: str) -> str:
@@ -1228,12 +1488,14 @@ class PostgresDoris(Postgres):
 
     def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_date_cast_syntax(sql)
+        sql = preprocess_negative_interval(sql)
         return super().parse(sql, **opts)
 
     def parse_into(
         self, expression_type: exp.IntoType, sql: str, **opts
     ) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_date_cast_syntax(sql)
+        sql = preprocess_negative_interval(sql)
         return super().parse_into(expression_type, sql, **opts)
 
 
@@ -1258,6 +1520,8 @@ def transpile_to_doris(
     convert_date_formats: bool = True,
     auto_add_delete_where: bool = True,
     convert_date_arith: bool = True,
+    convert_compound_interval: bool = True,
+    preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
 ) -> t.List[str]:
@@ -1302,6 +1566,25 @@ def transpile_to_doris(
         convert_date_arith: Whether to convert date +/- integer to DATE_ADD with INTERVAL (default True)
             - Doris doesn't support date - 1 syntax
             - date - 1 -> DATE_ADD(date, INTERVAL -1 DAY)
+        convert_compound_interval: Whether to expand PostgreSQL compound INTERVAL literals
+            into single-unit INTERVALs joined by +/- (default True)
+            - Doris/MySQL only accept INTERVAL n UNIT (single unit)
+            - X + INTERVAL '1 month -1 day' -> X + INTERVAL 1 MONTH - INTERVAL 1 DAY
+            - X - INTERVAL '1 month -1 day' -> X - INTERVAL 1 MONTH + INTERVAL 1 DAY
+              (outer sign is multiplied into every segment, matching PG semantics)
+            - Also normalizes single-unit plural forms: INTERVAL '5 days' -> INTERVAL 5 DAY
+        preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
+            NULL ordering when transpiling ORDER BY clauses (default False).
+            PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
+            the opposite (ASC NULLS FIRST / DESC NULLS LAST).
+            - False (default): emit Doris' native ordering; ``ORDER BY x`` stays
+              ``ORDER BY x``. Faster and shorter SQL, but result row order may
+              differ from PG when NULLs are present in the sort column. Use
+              this when downstream consumers do not depend on NULL position.
+            - True: emit a synthetic ``CASE WHEN x IS NULL THEN 1 ELSE 0 END``
+              extra sort key so that the row order matches PG byte-for-byte.
+              Use this when migration correctness for NULL-bearing columns is
+              required.
         drop_sequences: Whether to remove NEXTVAL columns from INSERT ... SELECT (default True)
             - Removes the column and NEXTVAL expression from INSERT ... SELECT
             - Also removes matching NEXTVAL from GROUP BY
@@ -1380,6 +1663,13 @@ def transpile_to_doris(
             if convert_date_arith:
                 normalized = convert_date_arithmetic(normalized)
 
+            # Expand PostgreSQL compound INTERVAL literals (e.g. '1 month -1 day')
+            # into single-unit INTERVALs joined by +/-. Must run AFTER
+            # convert_date_arithmetic, which itself can introduce single-unit
+            # INTERVAL nodes that this transform must leave untouched.
+            if convert_compound_interval:
+                normalized = expand_compound_interval(normalized)
+
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
                 normalized = drop_sequence_columns(normalized)
@@ -1389,7 +1679,10 @@ def transpile_to_doris(
                 # Pass Generator options (pretty, indent, etc.) to constructor
                 # Must pass dialect so IDENTIFIER_START/END use backticks (`) instead of double quotes (")
                 generator = DorisTranspileGenerator(
-                    dialect=write_dialect, **opts)
+                    dialect=write_dialect,
+                    preserve_pg_null_order=preserve_pg_null_order,
+                    **opts,
+                )
                 results.append(generator.generate(normalized, copy=False))
             else:
                 results.append(write_dialect.generate(
@@ -1492,8 +1785,10 @@ __all__ = [
     "convert_date_format_patterns",
     "add_where_to_delete",
     "convert_date_arithmetic",
+    "expand_compound_interval",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
+    "preprocess_negative_interval",
     "transpile_to_doris",
     "pg_to_doris",
     "spark_to_doris",
