@@ -1777,6 +1777,239 @@ def expand_like_any_all_array(expression: exp.Expression) -> exp.Expression:
 
 
 # --------------------------------------------------------------------------- #
+# PG TO_CHAR(numeric, fmt) -> Doris CAST(ROUND(x, N) AS STRING) rewrite
+# --------------------------------------------------------------------------- #
+
+# Characters allowed in PG numeric format strings (besides '0' and '9').
+# Anything else (letters, %, etc.) makes us fall back to the date-format path.
+#
+# NOTE: '-' / '/' are deliberately EXCLUDED. Although PG numeric format does
+# allow a leading '-' / '+' for sign, in practice format strings like
+# '0099-09-09' or '20240101' could be a user typing a date literal where a
+# format placeholder belongs. Using a hyphen / slash anywhere immediately
+# disqualifies the format from being treated as numeric.
+_NUMERIC_FMT_NEUTRAL_CHARS = set(" .,+")
+_NUMERIC_FMT_SUSPICIOUS_CHARS = set("-/")
+
+# Date-format tokens that appear in PG / MySQL / Doris date format strings.
+# Even one of these in the format string means "this is a date format,
+# do NOT rewrite as numeric".
+#
+# We compare against the format string in UPPERCASE.
+_DATE_FMT_TOKENS = (
+    # PG-style
+    "YYYY", "YY", "MM", "MON", "MONTH",
+    "DD", "DAY", "DY", "DDD",
+    "HH24", "HH12", "HH",
+    "MI", "SS", "MS", "US",
+    "AM", "PM", "TZ", "WW", "Q",
+    # MySQL/Doris style (always lowercase % prefix)
+    "%Y", "%M", "%D", "%H", "%I", "%S", "%P", "%W", "%X",
+)
+
+
+def _looks_like_numeric_format(fmt: str) -> t.Optional[int]:
+    """
+    Return decimal-place count if ``fmt`` is unambiguously a PG numeric format
+    string supported by the simplest rewrite (Section 4.1 of
+    docs/TO_CHAR_NUMERIC_DORIS.md). Return None otherwise (caller should
+    leave the node alone).
+
+    Supported tokens (case-insensitive):
+      0 9 . , + - and 'FM' prefix.
+
+    Anything else (D G L C MI PR S RN V EEEE %X YYYY MM ...) -> not supported,
+    return None.
+
+    Examples::
+
+        '0.999'      -> 3
+        '999.99'     -> 2
+        '999'        -> 0
+        'FM0.999'    -> 3
+        '9,999.99'   -> 2
+        'YYYY-MM-DD' -> None  (date)
+        'FM999D99'   -> None  (D = locale decimal point, complex)
+        '%Y-%m-%d'   -> None  (mysql date)
+        ''           -> None  (empty)
+    """
+    if not fmt:
+        return None
+
+    work = fmt
+    # Strip leading FM (case-insensitive). FM in PG suppresses padding;
+    # for our simple CAST-ROUND output this is the default behavior anyway.
+    if work[:2].upper() == "FM":
+        work = work[2:]
+
+    if not work:
+        return None
+
+    upper = fmt.upper()
+    for tok in _DATE_FMT_TOKENS:
+        if tok in upper:
+            return None
+
+    # If the format contains '-' or '/' it almost certainly is, or was
+    # intended to be, a date-shaped string ('0099-09-09', '20240101' style).
+    # Refuse to treat it as numeric. Real PG numeric formats use '.' / ','.
+    if any(ch in _NUMERIC_FMT_SUSPICIOUS_CHARS for ch in work):
+        return None
+
+    has_digit_token = False
+    for ch in work:
+        if ch in "09":
+            has_digit_token = True
+            continue
+        if ch in _NUMERIC_FMT_NEUTRAL_CHARS:
+            continue
+        return None
+
+    if not has_digit_token:
+        return None
+
+    if "." in work:
+        decimal_part = work.split(".", 1)[1]
+        return sum(1 for c in decimal_part if c in "09")
+    return 0
+
+
+def rewrite_to_char_numeric(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite PG ``TO_CHAR(numeric, fmt)`` (parsed as ``TimeToStr``) into Doris
+    ``CAST(ROUND(x, N) AS STRING)`` when the format string is unambiguously a
+    simple numeric format.
+
+    Background:
+        PG's ``TO_CHAR`` is polymorphic - given a number it formats numerically,
+        given a date it formats temporally. sqlglot collapses both into a single
+        ``TimeToStr`` AST node. The default Doris generator emits ``DATE_FORMAT``
+        for ``TimeToStr``, which fails at runtime when the first argument is a
+        DECIMAL ("Can not find compatibility function signature
+        date_format(DECIMALV3(...), VARCHAR)").
+
+    Rewrite (only for simple formats - see ``_looks_like_numeric_format``)::
+
+        TO_CHAR(BASE_RATE, '0.999')   -> CAST(ROUND(BASE_RATE, 3) AS STRING)
+        TO_CHAR(x, '999.99')          -> CAST(ROUND(x, 2) AS STRING)
+        TO_CHAR(x, '999')             -> CAST(CAST(x AS BIGINT) AS STRING)
+        TO_CHAR(x, 'FM0.999')         -> CAST(ROUND(x, 3) AS STRING)
+        TO_CHAR(x, '9,999.99')        -> CAST(ROUND(x, 2) AS STRING)
+                                          (NOTE: thousand separator is dropped)
+
+    Skipped (left as TimeToStr -> DATE_FORMAT, possibly with a warning when
+    the format string is suspiciously non-date-like):
+
+      - Date format strings (``'YYYY-MM-DD'``, ``'%Y-%m-%d'`` etc.) - leave to
+        the existing Doris DATE_FORMAT path; fully correct.
+      - Complex numeric tokens (``D G L C MI PR S RN V EEEE`` etc.) - keep the
+        original form and emit a logger.warning for manual review.
+      - Non-literal format (column / function / parameter) - cannot be
+        decided statically; warn.
+
+    Caveat (documented in section 4.2 of docs/TO_CHAR_NUMERIC_DORIS.md):
+      The rewrite uses ``CAST(ROUND(x, N) AS STRING)`` which DROPS trailing
+      zeros (PG ``'1.500'`` -> Doris ``'1.5'``). Per user decision this is
+      acceptable for current migration scope. If trailing-zero preservation
+      becomes important, switch to a more elaborate concat-based form.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    rewrites: t.List[t.Tuple[exp.TimeToStr, exp.Expression, int]] = []
+    suspicious: t.List[exp.TimeToStr] = []
+
+    for node in expression.find_all(exp.TimeToStr):
+        fmt_node = node.args.get("format")
+        if fmt_node is None:
+            continue
+
+        if not isinstance(fmt_node, exp.Literal) or not fmt_node.is_string:
+            # Format is a column, function, parameter etc. - we cannot
+            # statically tell whether it's numeric or date-shaped.
+            #
+            # We do NOT warn here because a runtime-decided format is rare
+            # and noisy warnings would drown out actionable signals; if Doris
+            # later barfs the user can manually inspect.
+            continue
+
+        fmt = fmt_node.this
+        n = _looks_like_numeric_format(fmt)
+        if n is not None:
+            rewrites.append((node, node.this, n))
+            continue
+
+        # Format string is NOT a recognized numeric format. Decide whether
+        # to emit a warning:
+        #
+        #   - If it contains a date token (YYYY/MM/DD/...) -> definitely
+        #     intended as date format, leave to DATE_FORMAT (correct).
+        #   - If it contains '-' or '/' -> likely a date-shaped string used
+        #     as a literal output template; DATE_FORMAT will pass through
+        #     literal characters fine, no warning needed.
+        #   - If it contains ONLY digit / dot / comma / sign / FM characters
+        #     plus letters that LOOK LIKE complex numeric tokens (D/G/MI/PR/
+        #     S/L/C/RN/V/EEEE) -> almost certainly intended as numeric
+        #     format that we cannot translate; warn so user can manually
+        #     rewrite.
+        #   - Otherwise (e.g. '20240101' literal pass-through) -> stay quiet.
+        upper = fmt.upper()
+        if any(tok in upper for tok in _DATE_FMT_TOKENS):
+            continue
+        if any(ch in _NUMERIC_FMT_SUSPICIOUS_CHARS for ch in fmt):
+            continue
+
+        # Look for letters that suggest "this was meant as a numeric format
+        # token I don't handle".
+        complex_numeric_tokens = ("D", "G", "L", "C", "MI", "PR", "S",
+                                  "RN", "V", "EEEE", "PL", "SG", "TH")
+        if any(tok in upper for tok in complex_numeric_tokens):
+            suspicious.append(node)
+
+    for node, value_expr, n in rewrites:
+        if n == 0:
+            # Integer-only format like '999' or '9999'.
+            # Build CAST(CAST(x AS BIGINT) AS STRING) so the output has no
+            # decimal point at all.
+            inner = exp.Cast(
+                this=value_expr.copy(),
+                to=exp.DataType.build("BIGINT"),
+            )
+            new_node: exp.Expression = exp.Cast(
+                this=inner,
+                to=exp.DataType.build("STRING"),
+            )
+        else:
+            rounded = exp.func(
+                "ROUND",
+                value_expr.copy(),
+                exp.Literal.number(n),
+            )
+            new_node = exp.Cast(
+                this=rounded,
+                to=exp.DataType.build("STRING"),
+            )
+        node.replace(new_node)
+
+    for node in suspicious:
+        fmt_str = node.args["format"].this
+        try:
+            value_sql = node.this.sql(dialect="postgres")
+        except Exception:
+            value_sql = "?"
+        logger.warning(
+            "PG TO_CHAR(%s, %r) 含 Doris 不支持的复杂数字格式 token "
+            "(D/G/MI/PR/S/L/C/RN/V/EEEE 等), 当前保留为 DATE_FORMAT 调用, "
+            "Doris 端会因签名不匹配报错, 请手工改写 "
+            "(例如 CAST(x AS STRING) 或 FORMAT(x, N))。",
+            value_sql,
+            fmt_str,
+        )
+
+    return expression
+
+
+# --------------------------------------------------------------------------- #
 # DELETE WHERE scalar-subquery -> USING (derived-table) rewrite
 # --------------------------------------------------------------------------- #
 
@@ -2217,6 +2450,7 @@ def transpile_to_doris(
     convert_tuple_in_subquery: bool = True,
     convert_delete_scalar_subquery: bool = True,
     expand_like_any_all: bool = True,
+    convert_to_char_numeric: bool = True,
     preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
@@ -2299,6 +2533,19 @@ def transpile_to_doris(
             - Only ARRAY literals are expanded; subqueries/functions on
               the RHS are left as-is with a warning
             - See docs/LIKE_ANY_ALL_DORIS.md for details
+        convert_to_char_numeric: Whether to rewrite PG ``TO_CHAR(numeric, fmt)``
+            calls (which sqlglot collapses into ``TimeToStr`` and would emit
+            as Doris ``DATE_FORMAT``) into Doris ``CAST(ROUND(x, N) AS STRING)``
+            when the format string is unambiguously a simple numeric format
+            (default True)
+            - Triggered when Doris reports "Can not find compatibility
+              function signature: date_format(DECIMAL..., VARCHAR)"
+            - Only simple formats (0/9/./,/FM) are rewritten; complex tokens
+              (D/G/MI/PR/S/L/C/RN/V/EEEE) are left alone with a warning
+            - Date format strings (YYYY/MM/DD/HH/...) are left to the
+              existing DATE_FORMAT path - this is correct
+            - Trailing zeros are NOT preserved by the simple form; see
+              docs/TO_CHAR_NUMERIC_DORIS.md §4.2 for the trade-off
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -2417,6 +2664,12 @@ def transpile_to_doris(
             # Doris's LIKE predicate rejects ARRAY right operands.
             if expand_like_any_all:
                 normalized = expand_like_any_all_array(normalized)
+
+            # Rewrite PG TO_CHAR(numeric, fmt) (parsed as TimeToStr) to
+            # CAST(ROUND(x, N) AS STRING) so Doris doesn't try to feed a
+            # decimal into DATE_FORMAT.
+            if convert_to_char_numeric:
+                normalized = rewrite_to_char_numeric(normalized)
 
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
@@ -2538,6 +2791,7 @@ __all__ = [
     "rewrite_tuple_in_subquery",
     "rewrite_delete_scalar_subquery",
     "expand_like_any_all_array",
+    "rewrite_to_char_numeric",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_negative_interval",
