@@ -1600,6 +1600,183 @@ def rewrite_tuple_in_subquery(expression: exp.Expression) -> exp.Expression:
 
 
 # --------------------------------------------------------------------------- #
+# LIKE/ILIKE ANY/ALL (ARRAY[...]) -> OR/AND chain expansion
+# --------------------------------------------------------------------------- #
+
+
+def _any_array_patterns(node: exp.Expression) -> t.Optional[t.List[exp.Expression]]:
+    """
+    If ``node`` is ``Any(Paren(Array(literals...)))`` or ``Any(Array(...))``,
+    return the list of array element expressions. Else return None.
+
+    We deliberately only match direct ``Array`` nodes - subqueries, function
+    calls returning arrays, or bare columns typed as array are NOT matched
+    (their values are unknown at compile time so we cannot enumerate them).
+    """
+    if not isinstance(node, exp.Any):
+        return None
+    inner = node.this
+    if isinstance(inner, exp.Paren):
+        inner = inner.this
+    if isinstance(inner, exp.Array):
+        return list(inner.expressions)
+    return None
+
+
+def _all_array_patterns(node: exp.Expression) -> t.Optional[t.List[exp.Expression]]:
+    """
+    Detect the ``LIKE ALL (ARRAY[...])`` shape. sqlglot represents ``ALL``
+    as ``Anonymous(name='ALL', expressions=[Array(...)])`` rather than a
+    dedicated node, which is why it's easy to miss.
+    """
+    if not isinstance(node, exp.Anonymous):
+        return None
+    if (node.name or "").upper() != "ALL":
+        return None
+    args = node.expressions
+    if len(args) == 1 and isinstance(args[0], exp.Array):
+        return list(args[0].expressions)
+    return None
+
+
+def expand_like_any_all_array(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite Doris-incompatible ``col LIKE ANY (ARRAY[...])`` / ``LIKE ALL``
+    predicates - including ``NOT LIKE`` and ``ILIKE`` variants - into
+    explicit OR/AND chains.
+
+    Background:
+        Doris does not support ``LIKE ANY/ALL (array)`` predicates at all.
+        When faced with the unsupported form it reports an obscure error
+        like "ARRAY<TEXT> cannot be cast to VARCHAR" because its type
+        checker sees an ARRAY right operand being fed to LIKE, which
+        expects VARCHAR. The fix is to expand the array into explicit
+        OR/AND chains so the predicate stops touching ARRAY types at all.
+
+    Rewrite matrix (given ``ps = [p1, p2, ...]``)::
+
+        col LIKE ANY (ARRAY ps)      ->  (col LIKE p1 OR  col LIKE p2  ...)
+        col LIKE ALL (ARRAY ps)      ->  (col LIKE p1 AND col LIKE p2  ...)
+        col NOT LIKE ANY (ARRAY ps)  ->  (col NOT LIKE p1 AND col NOT LIKE p2 ...)   (De Morgan)
+        col NOT LIKE ALL (ARRAY ps)  ->  (col NOT LIKE p1 OR  col NOT LIKE p2 ...)   (De Morgan)
+
+        ILIKE variants are analogous - an ``ILike`` node per pattern is
+        generated; a later pass (or the Doris dialect itself) turns each
+        ILike into ``LOWER(col) LIKE LOWER(pattern)``.
+
+    Precedence (critical):
+        sqlglot does NOT auto-emit precedence parens. ``AND(x, Or(a,b))``
+        serializes as ``x AND a OR b`` which is misparsed. We therefore
+        ALWAYS wrap the expanded chain in ``exp.Paren`` before replacing.
+
+    Scope:
+        - Only ``ARRAY[...]`` / ``ARRAY(...)`` LITERALS are expanded.
+        - ``LIKE ANY (SELECT ...)`` or any non-literal RHS is left alone
+          with a ``logger.warning``. Rewriting those to a safe Doris form
+          (typically EXISTS) is outside this transform's scope.
+
+    Returns:
+        The same AST, mutated in place.
+    """
+    rewrites: t.List[
+        t.Tuple[
+            exp.Expression,            # node to replace (like_node or its NOT wrapper)
+            bool,                      # is_not (was there a NOT wrapping)
+            bool,                      # is_ilike
+            str,                       # "ANY" or "ALL"
+            exp.Expression,            # col expression (LHS of LIKE)
+            t.List[exp.Expression],    # the pattern list
+        ]
+    ] = []
+
+    for like_node in expression.find_all(exp.Like, exp.ILike):
+        rhs = like_node.expression
+        patterns: t.Optional[t.List[exp.Expression]] = None
+        mode: t.Optional[str] = None
+
+        if isinstance(rhs, exp.Any):
+            patterns = _any_array_patterns(rhs)
+            if patterns is None:
+                # Any() wrapping a subquery/function/column - we cannot
+                # enumerate its elements statically. Leave as-is and
+                # warn; the user will see Doris error and can handle
+                # it manually (e.g. rewrite as EXISTS).
+                logger.warning(
+                    "LIKE/ILIKE ANY (非 ARRAY 字面量: 子查询/函数返回/列) "
+                    "Doris 不支持，自动改写未覆盖此形态，保留原样: %s",
+                    _short_sql(like_node),
+                )
+                continue
+            mode = "ANY"
+        elif isinstance(rhs, exp.Anonymous) and (rhs.name or "").upper() == "ALL":
+            patterns = _all_array_patterns(rhs)
+            if patterns is None:
+                logger.warning(
+                    "LIKE/ILIKE ALL (非 ARRAY 字面量) Doris 不支持，"
+                    "自动改写未覆盖此形态，保留原样: %s",
+                    _short_sql(like_node),
+                )
+                continue
+            mode = "ALL"
+        else:
+            continue
+
+        if not patterns:
+            # Empty array: the predicate is vacuously TRUE (ALL) or
+            # FALSE (ANY). We leave it alone - such SQL is almost
+            # certainly a bug upstream and silently rewriting would
+            # hide it.
+            logger.warning(
+                "LIKE/ILIKE %s (空 ARRAY) 为恒真/恒假的退化情况，保留原样: %s",
+                mode,
+                _short_sql(like_node),
+            )
+            continue
+
+        is_ilike = isinstance(like_node, exp.ILike)
+        parent = like_node.parent
+        is_not = isinstance(parent, exp.Not)
+        target = parent if is_not else like_node
+        col = like_node.this
+
+        rewrites.append((target, is_not, is_ilike, mode, col, patterns))
+
+    for target, is_not, is_ilike, mode, col, patterns in rewrites:
+        cmp_cls: t.Type[exp.Expression] = exp.ILike if is_ilike else exp.Like
+
+        preds: t.List[exp.Expression] = []
+        for pat in patterns:
+            pred: exp.Expression = cmp_cls(this=col.copy(), expression=pat.copy())
+            if is_not:
+                pred = exp.Not(this=pred)
+            preds.append(pred)
+
+        # Choose the combining connective. De Morgan flips it whenever
+        # there's an outer NOT: ANY/OR and ALL/AND are natural pairs;
+        # applying NOT swaps them.
+        #
+        # Truth table (mode, is_not) -> use_and:
+        #   (ANY, False) -> OR    => use_and = False
+        #   (ANY, True)  -> AND   => use_and = True
+        #   (ALL, False) -> AND   => use_and = True
+        #   (ALL, True)  -> OR    => use_and = False
+        # Which is exactly: use_and = (mode == "ALL") XOR is_not
+        use_and = (mode == "ALL") != is_not
+        join_cls: t.Type[exp.Expression] = exp.And if use_and else exp.Or
+
+        combined: exp.Expression = preds[0]
+        for p in preds[1:]:
+            combined = join_cls(this=combined, expression=p)
+
+        # Always wrap in parens: sqlglot does not emit precedence parens
+        # automatically. Omitting this causes ``WHERE flag AND col LIKE ANY(...)``
+        # expansion to bind incorrectly as ``flag AND pred1 OR pred2 ...``.
+        target.replace(exp.Paren(this=combined))
+
+    return expression
+
+
+# --------------------------------------------------------------------------- #
 # DELETE WHERE scalar-subquery -> USING (derived-table) rewrite
 # --------------------------------------------------------------------------- #
 
@@ -2039,6 +2216,7 @@ def transpile_to_doris(
     normalize_date_trunc: bool = True,
     convert_tuple_in_subquery: bool = True,
     convert_delete_scalar_subquery: bool = True,
+    expand_like_any_all: bool = True,
     preserve_pg_null_order: bool = False,
     drop_sequences: bool = True,
     **opts,
@@ -2112,6 +2290,15 @@ def transpile_to_doris(
               other transforms or left as-is
             - DELETE with a manually-written USING is left untouched
             - See docs/DELETE_SUBQUERY_DORIS.md for the full rationale
+        expand_like_any_all: Whether to rewrite ``col LIKE/ILIKE ANY/ALL (ARRAY[...])``
+            predicates into explicit OR/AND chains (default True)
+            - Doris does not support ``LIKE ANY/ALL (array)`` and the error
+              surfaces as "ARRAY<TEXT> cannot be cast to VARCHAR"
+            - Covers 6 variants: {LIKE, NOT LIKE, ILIKE} x {ANY, ALL}
+            - De Morgan applied automatically for NOT cases
+            - Only ARRAY literals are expanded; subqueries/functions on
+              the RHS are left as-is with a warning
+            - See docs/LIKE_ANY_ALL_DORIS.md for details
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -2225,6 +2412,11 @@ def transpile_to_doris(
             # subqueries directly inside WHERE.
             if convert_delete_scalar_subquery:
                 normalized = rewrite_delete_scalar_subquery(normalized)
+
+            # Expand LIKE/ILIKE ANY/ALL (ARRAY[...]) into OR/AND chains;
+            # Doris's LIKE predicate rejects ARRAY right operands.
+            if expand_like_any_all:
+                normalized = expand_like_any_all_array(normalized)
 
             # Remove NEXTVAL columns from INSERT ... SELECT
             if drop_sequences:
@@ -2345,6 +2537,7 @@ __all__ = [
     "normalize_date_trunc_unit",
     "rewrite_tuple_in_subquery",
     "rewrite_delete_scalar_subquery",
+    "expand_like_any_all_array",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_negative_interval",
