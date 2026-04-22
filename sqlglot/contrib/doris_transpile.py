@@ -1027,103 +1027,132 @@ def add_where_to_delete(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
-SEQUENCE_FUNCS = {"NEXTVAL", "CURRVAL", "SETVAL", "LASTVAL", "SEQUENCE"}
-
-
-def _is_sequence_call(node: exp.Expression) -> bool:
-    """Check if a node is a sequence function call (NEXTVAL, CURRVAL, etc.)."""
+def _is_nextval_call(node: exp.Expression) -> bool:
+    """Check if a node is a NEXTVAL(...) function call."""
     if isinstance(node, exp.Anonymous):
         try:
-            return node.name.upper() in SEQUENCE_FUNCS
+            return node.name.upper() == "NEXTVAL"
         except Exception:
             pass
     return False
 
 
-def _expr_contains_sequence(node: exp.Expression) -> bool:
-    """Check if an expression or any descendant is a sequence call."""
-    if _is_sequence_call(node):
-        return True
-    for child in node.find_all(exp.Anonymous):
-        if _is_sequence_call(child):
-            return True
-    return False
+def _make_null_literal() -> exp.Expression:
+    """Build an AST node that renders as the bare SQL keyword ``NULL``.
 
-
-def drop_sequence_columns(expression: exp.Expression) -> exp.Expression:
+    Doris' AUTO_INCREMENT column will fill in a generated value whenever the
+    source row's value is ``NULL``, so we emit a plain SQL NULL for every
+    ``NEXTVAL(...)`` call we rewrite. ``NULL`` is accepted by Doris both in
+    SELECT lists and in VALUES tuples, unlike the ``DEFAULT`` keyword which
+    is only valid inside VALUES/SET.
     """
-    Remove NEXTVAL columns from INSERT INTO ... SELECT statements.
+    return exp.Null()
 
-    Assumes Doris target table has AUTO_INCREMENT on the corresponding column,
-    so the column and its NEXTVAL expression can simply be removed. Any matching
-    NEXTVAL calls in GROUP BY are also removed (they only existed to satisfy
-    PostgreSQL's syntax requirement that SELECT columns appear in GROUP BY).
 
-    Only processes INSERT ... SELECT statements with an explicit column list.
-    Other statement types are returned unchanged.
+def replace_nextval_with_default(expression: exp.Expression) -> exp.Expression:
+    """
+    Replace ``NEXTVAL('seq')`` with a plain ``NULL`` inside INSERT statements
+    so Doris' AUTO_INCREMENT column generates the value.
 
-    Before (PostgreSQL):
+    The function is named ``replace_nextval_with_default`` for historical
+    reasons (the target used to be the ``DEFAULT`` keyword). We ultimately
+    settled on ``NULL`` because Doris' parser only accepts the ``DEFAULT``
+    keyword inside VALUES/SET contexts — any ``SELECT ... DEFAULT ...``
+    clause is rejected with ``mismatched input ... expecting '('``, so a
+    single uniform rewrite target is preferable for both shapes.
+
+    Supported shapes:
+
+    * ``INSERT INTO t (...) SELECT ..., NEXTVAL('seq') [AS id], ... FROM ...``
+      Each ``NEXTVAL`` in a top-level SELECT expression is replaced with
+      ``NULL``; an existing ``AS <alias>`` is preserved
+      (``NEXTVAL('s') AS id`` → ``NULL AS id``). The INSERT column list is
+      left untouched.
+
+    * ``INSERT INTO t (...) VALUES (..., NEXTVAL('seq'), ...)``
+      Each ``NEXTVAL`` at the top level of a VALUES tuple is replaced with
+      ``NULL``.
+
+    * ``GROUP BY NEXTVAL('seq')`` inside an ``INSERT ... SELECT`` —
+      because the value is rewritten to a constant ``NULL`` (which is not
+      a meaningful ``GROUP BY`` expression), any matching top-level
+      ``NEXTVAL`` in the GROUP BY is dropped. If the GROUP BY becomes
+      empty as a result, it is removed entirely.
+
+    Deliberately NOT handled:
+
+    * ``UPDATE t SET col = NEXTVAL('s')`` — left as-is, will surface as a
+      Doris error so the author can migrate explicitly.
+    * Bare ``SELECT NEXTVAL('s')`` outside an INSERT — same rationale.
+    * ``NEXTVAL`` inside ``WHERE`` or nested expressions such as
+      ``COALESCE(id, NEXTVAL('s'))`` — only top-level replacements are
+      safe; the rest is left for Doris to reject.
+    * Other PostgreSQL sequence functions (``CURRVAL`` / ``SETVAL`` /
+      ``LASTVAL``) — their semantics do not map to AUTO_INCREMENT.
+
+    Before (PostgreSQL)::
+
         INSERT INTO t (id, data_dt, node_no)
-        SELECT NEXTVAL('seq') AS id, data_dt, txn_node_no
-        FROM tmp
-        GROUP BY NEXTVAL('seq'), data_dt
+        SELECT NEXTVAL('seq') AS id, data_dt, txn_node_no FROM tmp
 
-    After (Doris):
-        INSERT INTO t (data_dt, node_no)
-        SELECT data_dt, txn_node_no
-        FROM tmp
-        GROUP BY data_dt
+    After (Doris)::
+
+        INSERT INTO t (id, data_dt, node_no)
+        SELECT NULL AS id, data_dt, txn_node_no FROM tmp
 
     Args:
-        expression: The AST to process
+        expression: The AST to process (modified in place and returned).
 
     Returns:
-        The processed AST
+        The processed AST.
     """
     if not isinstance(expression, exp.Insert):
         return expression
 
-    target = expression.this
-    select = expression.args.get("expression")
-
-    if target is None or select is None or not isinstance(select, exp.Select):
+    body = expression.args.get("expression")
+    if body is None:
         return expression
 
-    columns = list(target.expressions) if hasattr(target, "expressions") else []
-    if not columns:
-        return expression
+    if isinstance(body, exp.Select):
+        for i, sel_expr in enumerate(list(body.expressions)):
+            if isinstance(sel_expr, exp.Alias):
+                if _is_nextval_call(sel_expr.this):
+                    sel_expr.set("this", _make_null_literal())
+            elif _is_nextval_call(sel_expr):
+                body.expressions[i] = _make_null_literal()
 
-    # Find which SELECT positions contain sequence calls
-    seq_indices: t.Set[int] = set()
-    for i, sel_expr in enumerate(select.expressions):
-        actual = sel_expr.this if isinstance(sel_expr, exp.Alias) else sel_expr
-        if _expr_contains_sequence(actual):
-            seq_indices.add(i)
+        # Strip top-level NEXTVAL(...) entries from GROUP BY. A constant
+        # ``NULL`` is not a useful GROUP BY expression, and the original
+        # NEXTVAL was usually only there to satisfy PostgreSQL's "every
+        # SELECT expression must appear in GROUP BY" rule.
+        group = body.args.get("group")
+        if group is not None and hasattr(group, "expressions"):
+            new_group_exprs = [
+                g for g in group.expressions if not _is_nextval_call(g)
+            ]
+            if len(new_group_exprs) != len(group.expressions):
+                if new_group_exprs:
+                    group.set("expressions", new_group_exprs)
+                else:
+                    body.set("group", None)
 
-    if not seq_indices:
-        return expression
-
-    # Remove sequence columns from INSERT column list
-    new_columns = [c for i, c in enumerate(columns) if i not in seq_indices]
-    target.set("expressions", new_columns)
-
-    # Remove corresponding SELECT expressions
-    new_sel_exprs = [e for i, e in enumerate(select.expressions) if i not in seq_indices]
-    select.set("expressions", new_sel_exprs)
-
-    # Remove matching NEXTVAL calls from GROUP BY
-    group = select.args.get("group")
-    if group:
-        group_exprs = group.expressions if hasattr(group, "expressions") else []
-        new_group_exprs = [
-            g for g in group_exprs if not _expr_contains_sequence(g)
-        ]
-        if not new_group_exprs:
-            select.set("group", None)
-        else:
-            group.set("expressions", new_group_exprs)
+    elif isinstance(body, exp.Values):
+        for tup in body.expressions:
+            if not isinstance(tup, exp.Tuple):
+                continue
+            for i, item in enumerate(list(tup.expressions)):
+                if _is_nextval_call(item):
+                    tup.expressions[i] = _make_null_literal()
 
     return expression
+
+
+# --- Backward-compatible aliases (kept so external callers keep working) ---
+# Previous name dropped the whole column; the new behaviour keeps the column
+# and only rewrites the value, but we preserve the old symbol so imports like
+# ``from sqlglot.contrib.doris_transpile import drop_sequence_columns`` still
+# resolve.
+drop_sequence_columns = replace_nextval_with_default
 
 
 def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
@@ -1969,10 +1998,18 @@ def rewrite_to_char_numeric(expression: exp.Expression) -> exp.Expression:
     for node, value_expr, n in rewrites:
         if n == 0:
             # Integer-only format like '999' or '9999'.
-            # Build CAST(CAST(x AS BIGINT) AS STRING) so the output has no
-            # decimal point at all.
+            # PG TO_CHAR(x, '999') rounds half-away-from-zero, so we need
+            # ROUND(x, 0) before CAST; otherwise Doris CAST DECIMAL->BIGINT
+            # truncates toward zero and diverges from PG (e.g. 100.5 -> 100
+            # instead of 101). Wrap in CAST(... AS BIGINT) to drop the fractional
+            # zero from the STRING output.
+            rounded_int = exp.func(
+                "ROUND",
+                value_expr.copy(),
+                exp.Literal.number(0),
+            )
             inner = exp.Cast(
-                this=value_expr.copy(),
+                this=rounded_int,
                 to=exp.DataType.build("BIGINT"),
             )
             new_node: exp.Expression = exp.Cast(
@@ -2452,7 +2489,8 @@ def transpile_to_doris(
     expand_like_any_all: bool = True,
     convert_to_char_numeric: bool = True,
     preserve_pg_null_order: bool = False,
-    drop_sequences: bool = True,
+    nextval_to_default: bool = True,
+    drop_sequences: t.Optional[bool] = None,
     **opts,
 ) -> t.List[str]:
     """
@@ -2558,10 +2596,26 @@ def transpile_to_doris(
               extra sort key so that the row order matches PG byte-for-byte.
               Use this when migration correctness for NULL-bearing columns is
               required.
-        drop_sequences: Whether to remove NEXTVAL columns from INSERT ... SELECT (default True)
-            - Removes the column and NEXTVAL expression from INSERT ... SELECT
-            - Also removes matching NEXTVAL from GROUP BY
+        nextval_to_default: Whether to replace ``NEXTVAL('seq')`` with ``NULL``
+            inside INSERT statements so Doris' AUTO_INCREMENT column fills the
+            value (default True). Kept under this name for historical reasons;
+            the actual rewrite target is ``NULL`` because Doris rejects the
+            ``DEFAULT`` keyword inside a SELECT list.
+            - ``INSERT ... SELECT NEXTVAL('s') AS id, ...``
+              → ``INSERT ... SELECT NULL AS id, ...``
+            - ``INSERT ... VALUES (NEXTVAL('s'), ...)``
+              → ``INSERT ... VALUES (NULL, ...)``
+            - Top-level ``NEXTVAL`` in an ``INSERT ... SELECT``'s GROUP BY
+              is dropped (NULL is not a meaningful grouping key)
+            - The INSERT column list is preserved (nothing is dropped)
             - Assumes Doris target table has AUTO_INCREMENT on the corresponding column
+            - Only top-level NEXTVAL calls are replaced; NEXTVAL in UPDATE SET,
+              WHERE, or nested expressions is left untouched so Doris can reject
+              it explicitly
+        drop_sequences: Deprecated alias for ``nextval_to_default``. Kept for
+            backward compatibility; if provided, it overrides
+            ``nextval_to_default``. The old behaviour that dropped the entire
+            column has been superseded by this safer rewrite.
         **opts: Other Generator options (e.g., pretty=True)
 
     Note:
@@ -2671,9 +2725,15 @@ def transpile_to_doris(
             if convert_to_char_numeric:
                 normalized = rewrite_to_char_numeric(normalized)
 
-            # Remove NEXTVAL columns from INSERT ... SELECT
-            if drop_sequences:
-                normalized = drop_sequence_columns(normalized)
+            # Replace top-level NEXTVAL(...) inside INSERT statements with the
+            # DEFAULT keyword so Doris' AUTO_INCREMENT column fills the value.
+            # ``drop_sequences`` is the old parameter name; if the caller sets
+            # it explicitly we honour it for backward compatibility.
+            _nextval_flag = (
+                drop_sequences if drop_sequences is not None else nextval_to_default
+            )
+            if _nextval_flag:
+                normalized = replace_nextval_with_default(normalized)
 
             # Use custom generator for Doris to handle E-strings correctly
             if write == "doris":
@@ -2701,7 +2761,8 @@ def pg_to_doris(
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
     regexp_split_to_lateral: bool = True,
-    drop_sequences: bool = True,
+    nextval_to_default: bool = True,
+    drop_sequences: t.Optional[bool] = None,
     **opts,
 ) -> t.List[str]:
     """
@@ -2712,9 +2773,14 @@ def pg_to_doris(
         >>> pg_to_doris("SELECT T.id FROM TEST t")
         ['SELECT t.id FROM test AS t']
         >>>
-        >>> # NEXTVAL columns are dropped from INSERT ... SELECT
+        >>> # NEXTVAL is replaced with NULL so Doris' AUTO_INCREMENT column
+        >>> # generates the value. The INSERT column list is kept intact.
+        >>> # (``DEFAULT`` cannot appear inside a Doris SELECT list, so we
+        >>> # standardise on NULL in both SELECT and VALUES forms.)
         >>> pg_to_doris("INSERT INTO t(id, name) SELECT NEXTVAL('seq'), n FROM src")
-        ["INSERT INTO t (`name`) SELECT n FROM src"]
+        ['INSERT INTO t (id, `name`) SELECT NULL, n FROM src']
+        >>> pg_to_doris("INSERT INTO t(id, name) VALUES (NEXTVAL('seq'), 'a')")
+        ["INSERT INTO t (id, `name`) VALUES (NULL, 'a')"]
     """
     return transpile_to_doris(
         sql,
@@ -2724,6 +2790,7 @@ def pg_to_doris(
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
         regexp_split_to_lateral=regexp_split_to_lateral,
+        nextval_to_default=nextval_to_default,
         drop_sequences=drop_sequences,
         **opts
     )
