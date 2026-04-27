@@ -1027,6 +1027,33 @@ def add_where_to_delete(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def add_if_exists_to_drop_table(expression: exp.Expression) -> exp.Expression:
+    """
+    Add IF EXISTS to DROP TABLE statements.
+
+    Doris accepts ``DROP TABLE IF EXISTS`` and this makes generated migration
+    SQL idempotent when the source PostgreSQL statement omitted the guard.
+    Other DROP kinds (VIEW, INDEX, etc.) are intentionally left unchanged.
+
+    Before (PostgreSQL):
+        DROP TABLE schema1.table1;
+
+    After (Doris):
+        DROP TABLE IF EXISTS schema1.table1;
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with IF EXISTS added to DROP TABLE statements
+    """
+    for drop in expression.find_all(exp.Drop):
+        if drop.kind == "TABLE" and not drop.args.get("exists"):
+            drop.set("exists", True)
+
+    return expression
+
+
 def _is_nextval_call(node: exp.Expression) -> bool:
     """Check if a node is a NEXTVAL(...) function call."""
     if isinstance(node, exp.Anonymous):
@@ -2695,6 +2722,7 @@ def transpile_to_doris(
     preserve_ascii: bool = True,
     convert_date_formats: bool = True,
     auto_add_delete_where: bool = True,
+    auto_add_drop_table_if_exists: bool = True,
     convert_date_arith: bool = True,
     convert_compound_interval: bool = True,
     normalize_date_trunc: bool = True,
@@ -2746,6 +2774,12 @@ def transpile_to_doris(
         auto_add_delete_where: Whether to auto-add WHERE 1=1 to DELETE without WHERE (default True)
             - Doris requires DELETE statements to have a WHERE clause
             - DELETE FROM t -> DELETE FROM t WHERE 1 = 1
+        auto_add_drop_table_if_exists: Whether to auto-add IF EXISTS to DROP TABLE
+            statements (default True)
+            - Makes generated migration SQL idempotent for Doris
+            - DROP TABLE t -> DROP TABLE IF EXISTS t
+            - Does not affect DROP VIEW, DROP INDEX, or statements that already
+              include IF EXISTS
         convert_date_arith: Whether to convert date +/- integer to DATE_ADD with INTERVAL (default True)
             - Doris doesn't support date - 1 syntax
             - date - 1 -> DATE_ADD(date, INTERVAL -1 DAY)
@@ -2929,6 +2963,10 @@ def transpile_to_doris(
             if auto_add_delete_where:
                 normalized = add_where_to_delete(normalized)
 
+            # Add IF EXISTS to DROP TABLE statements for idempotent Doris DDL
+            if auto_add_drop_table_if_exists:
+                normalized = add_if_exists_to_drop_table(normalized)
+
             # Convert date arithmetic (date +/- integer) to DATE_ADD with INTERVAL
             if convert_date_arith:
                 normalized = convert_date_arithmetic(normalized)
@@ -3101,6 +3139,7 @@ __all__ = [
     "preserve_ascii_function",
     "convert_date_format_patterns",
     "add_where_to_delete",
+    "add_if_exists_to_drop_table",
     "convert_date_arithmetic",
     "expand_compound_interval",
     "normalize_date_trunc_unit",
