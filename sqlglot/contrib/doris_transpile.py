@@ -1076,6 +1076,49 @@ def _make_null_literal() -> exp.Expression:
     return exp.Null()
 
 
+def _replace_nextval_in_select(select: exp.Select) -> None:
+    for i, sel_expr in enumerate(list(select.expressions)):
+        if isinstance(sel_expr, exp.Alias):
+            if _is_nextval_call(sel_expr.this):
+                sel_expr.set("this", _make_null_literal())
+        elif _is_nextval_call(sel_expr):
+            select.expressions[i] = _make_null_literal()
+
+    # Strip top-level NEXTVAL(...) entries from GROUP BY. A constant
+    # ``NULL`` is not a useful GROUP BY expression, and the original
+    # NEXTVAL was usually only there to satisfy PostgreSQL's "every
+    # SELECT expression must appear in GROUP BY" rule.
+    group = select.args.get("group")
+    if group is not None and hasattr(group, "expressions"):
+        new_group_exprs = [
+            g for g in group.expressions if not _is_nextval_call(g)
+        ]
+        if len(new_group_exprs) != len(group.expressions):
+            if new_group_exprs:
+                group.set("expressions", new_group_exprs)
+            else:
+                select.set("group", None)
+
+
+def _replace_nextval_in_values(values: exp.Values) -> None:
+    for tup in values.expressions:
+        if not isinstance(tup, exp.Tuple):
+            continue
+        for i, item in enumerate(list(tup.expressions)):
+            if _is_nextval_call(item):
+                tup.expressions[i] = _make_null_literal()
+
+
+def _replace_nextval_in_insert_body(body: exp.Expression) -> None:
+    if isinstance(body, exp.Select):
+        _replace_nextval_in_select(body)
+    elif isinstance(body, exp.Values):
+        _replace_nextval_in_values(body)
+    elif isinstance(body, exp.Union) and body.args.get("distinct") is False:
+        _replace_nextval_in_insert_body(body.this)
+        _replace_nextval_in_insert_body(body.expression)
+
+
 def replace_nextval_with_default(expression: exp.Expression) -> exp.Expression:
     """
     Replace ``NEXTVAL('seq')`` with a plain ``NULL`` inside INSERT statements
@@ -1106,6 +1149,10 @@ def replace_nextval_with_default(expression: exp.Expression) -> exp.Expression:
       ``NEXTVAL`` in the GROUP BY is dropped. If the GROUP BY becomes
       empty as a result, it is removed entirely.
 
+    * ``INSERT INTO t (...) SELECT NEXTVAL('seq') ... UNION ALL SELECT
+      NEXTVAL('seq') ...`` — each SELECT arm in the set operation is handled
+      with the same top-level SELECT-list rules.
+
     Deliberately NOT handled:
 
     * ``UPDATE t SET col = NEXTVAL('s')`` — left as-is, will surface as a
@@ -1114,6 +1161,9 @@ def replace_nextval_with_default(expression: exp.Expression) -> exp.Expression:
     * ``NEXTVAL`` inside ``WHERE`` or nested expressions such as
       ``COALESCE(id, NEXTVAL('s'))`` — only top-level replacements are
       safe; the rest is left for Doris to reject.
+    * ``NEXTVAL`` inside plain ``UNION`` / ``INTERSECT`` / ``EXCEPT`` arms —
+      set semantics can depend on the sequence-generated value, so only
+      ``UNION ALL`` is rewritten automatically.
     * Other PostgreSQL sequence functions (``CURRVAL`` / ``SETVAL`` /
       ``LASTVAL``) — their semantics do not map to AUTO_INCREMENT.
 
@@ -1140,36 +1190,7 @@ def replace_nextval_with_default(expression: exp.Expression) -> exp.Expression:
     if body is None:
         return expression
 
-    if isinstance(body, exp.Select):
-        for i, sel_expr in enumerate(list(body.expressions)):
-            if isinstance(sel_expr, exp.Alias):
-                if _is_nextval_call(sel_expr.this):
-                    sel_expr.set("this", _make_null_literal())
-            elif _is_nextval_call(sel_expr):
-                body.expressions[i] = _make_null_literal()
-
-        # Strip top-level NEXTVAL(...) entries from GROUP BY. A constant
-        # ``NULL`` is not a useful GROUP BY expression, and the original
-        # NEXTVAL was usually only there to satisfy PostgreSQL's "every
-        # SELECT expression must appear in GROUP BY" rule.
-        group = body.args.get("group")
-        if group is not None and hasattr(group, "expressions"):
-            new_group_exprs = [
-                g for g in group.expressions if not _is_nextval_call(g)
-            ]
-            if len(new_group_exprs) != len(group.expressions):
-                if new_group_exprs:
-                    group.set("expressions", new_group_exprs)
-                else:
-                    body.set("group", None)
-
-    elif isinstance(body, exp.Values):
-        for tup in body.expressions:
-            if not isinstance(tup, exp.Tuple):
-                continue
-            for i, item in enumerate(list(tup.expressions)):
-                if _is_nextval_call(item):
-                    tup.expressions[i] = _make_null_literal()
+    _replace_nextval_in_insert_body(body)
 
     return expression
 
