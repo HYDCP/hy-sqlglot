@@ -114,6 +114,13 @@ class DorisTranspileGenerator(Doris.Generator):
         with_fill = f" {with_fill}" if with_fill else ""
         return f"{this}{sort_order}{with_fill}"
 
+    def datatype_sql(self, expression: exp.DataType) -> str:
+        if expression.is_type(exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMPTZ):
+            if expression.expressions:
+                return f"DATETIMEV2({self.expressions(expression, flat=True)})"
+
+        return super().datatype_sql(expression)
+
     # ------------------------------------------------------------------ #
     # ADB(PostgreSQL) -> Doris specific: preserve "-- ... /*xxx*/"
     # ------------------------------------------------------------------ #
