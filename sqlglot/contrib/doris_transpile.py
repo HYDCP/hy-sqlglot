@@ -2710,6 +2710,14 @@ class PostgresDoris(Postgres):
         tree = sqlglot.parse_one("SELECT date'20260201'::varchar", read='postgresdoris')
     """
 
+    class Parser(Postgres.Parser):
+        FUNCTIONS = {
+            **Postgres.Parser.FUNCTIONS,
+            # PostgreSQL TO_DATE accepts a format argument, but Doris TO_DATE
+            # only accepts the value. Keep STR_TO_DATE(...) on its own path.
+            "TO_DATE": exp.TsOrDsToDate.from_arg_list,
+        }
+
     def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_date_cast_syntax(sql)
         sql = preprocess_negative_interval(sql)
