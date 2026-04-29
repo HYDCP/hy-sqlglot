@@ -1652,13 +1652,24 @@ _DATE_TRUNC_UNIT_SINGULARS = {
     "SECOND",
 }
 
+_DATE_TRUNC_UNIT_ALIASES = {
+    "MON": "MONTH",
+}
+
+_DATE_TRUNC_UNIT_NAMES = (
+    _DATE_TRUNC_UNIT_SINGULARS
+    | {f"{unit}S" for unit in _DATE_TRUNC_UNIT_SINGULARS}
+    | set(_DATE_TRUNC_UNIT_ALIASES)
+)
+
 
 def normalize_date_trunc_unit(expression: exp.Expression) -> exp.Expression:
     """
-    Normalize DATE_TRUNC unit names to Doris-accepted singular forms.
+    Normalize DATE_TRUNC unit names to Doris-accepted unit forms.
 
-    PostgreSQL's ``date_trunc`` accepts plural unit names (e.g. ``'months'``,
-    ``'days'``). Doris' ``DATE_TRUNC`` documents and enforces a strict
+    PostgreSQL's ``date_trunc`` accepts abbreviated and plural unit names
+    (e.g. ``'mon'``, ``'months'``, ``'days'``). Doris' ``DATE_TRUNC``
+    documents and enforces a strict
     singular-only whitelist
     (``year|quarter|month|week|day|hour|minute|second``) and raises an error
     on anything else. This transform strips the trailing ``S`` from the
@@ -1667,6 +1678,7 @@ def normalize_date_trunc_unit(expression: exp.Expression) -> exp.Expression:
 
     Examples:
         DATE_TRUNC(x, 'MONTHS')   -> DATE_TRUNC(x, 'MONTH')
+        DATE_TRUNC(x, 'MON')      -> DATE_TRUNC(x, 'MONTH')
         DATE_TRUNC(x, 'DAYS')     -> DATE_TRUNC(x, 'DAY')
         DATE_TRUNC(x, 'QUARTERS') -> DATE_TRUNC(x, 'QUARTER')
         DATE_TRUNC(x, 'MONTH')    -> unchanged
@@ -1683,9 +1695,121 @@ def normalize_date_trunc_unit(expression: exp.Expression) -> exp.Expression:
         if not isinstance(unit, exp.Var):
             continue
         name = unit.name.upper()
+        if name in _DATE_TRUNC_UNIT_ALIASES:
+            unit.set("this", _DATE_TRUNC_UNIT_ALIASES[name])
+            continue
         if len(name) > 1 and name.endswith("S") and name[:-1] in _DATE_TRUNC_UNIT_SINGULARS:
             unit.set("this", name[:-1])
     return expression
+
+
+def _split_top_level_args(args_sql: str) -> t.Optional[t.Tuple[str, str]]:
+    depth = 0
+    quote: t.Optional[str] = None
+    i = 0
+
+    while i < len(args_sql):
+        char = args_sql[i]
+        if quote:
+            if char == quote:
+                if quote == "'" and i + 1 < len(args_sql) and args_sql[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if char in ("'", '"'):
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return args_sql[:i], args_sql[i + 1 :]
+
+        i += 1
+
+    return None
+
+
+def _date_trunc_unit_name(unit_sql: str) -> t.Optional[str]:
+    value = unit_sql.strip()
+    quoted = re.fullmatch(r"'([^']+)'", value)
+
+    if quoted:
+        value = quoted.group(1)
+
+    name = value.upper()
+    return name if name in _DATE_TRUNC_UNIT_NAMES else None
+
+
+def preprocess_doris_date_trunc_order(sql: str) -> str:
+    """
+    Accept Doris-order DATE_TRUNC(date, unit) before parsing as PostgreSQL.
+
+    ``pg_to_doris`` parses with the PostgreSQL dialect, whose DATE_TRUNC
+    expects ``DATE_TRUNC(unit, date)``. Some callers already pass Doris-style
+    DATE_TRUNC expressions through this contrib helper, so normalize only calls
+    whose second top-level argument is a known date part.
+    """
+    pattern = re.compile(r"\bDATE_TRUNC\s*\(", re.IGNORECASE)
+    result: t.List[str] = []
+    index = 0
+
+    while True:
+        match = pattern.search(sql, index)
+        if not match:
+            result.append(sql[index:])
+            break
+
+        start_args = match.end()
+        depth = 1
+        quote: t.Optional[str] = None
+        i = start_args
+
+        while i < len(sql):
+            char = sql[i]
+            if quote:
+                if char == quote:
+                    if quote == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+
+            if char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+
+        if depth != 0:
+            result.append(sql[index:])
+            break
+
+        args_sql = sql[start_args:i]
+        args = _split_top_level_args(args_sql)
+        replacement = sql[match.start() : i + 1]
+
+        if args:
+            first, second = args
+            first_unit = _date_trunc_unit_name(first)
+            second_unit = _date_trunc_unit_name(second)
+
+            if second_unit and not first_unit:
+                replacement = f"DATE_TRUNC({second.strip()}, {first.strip()})"
+
+        result.append(sql[index : match.start()])
+        result.append(replacement)
+        index = i + 1
+
+    return "".join(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -2726,6 +2850,7 @@ class PostgresDoris(Postgres):
         }
 
     def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
+        sql = preprocess_doris_date_trunc_order(sql)
         sql = preprocess_date_cast_syntax(sql)
         sql = preprocess_negative_interval(sql)
         return super().parse(sql, **opts)
@@ -2733,6 +2858,7 @@ class PostgresDoris(Postgres):
     def parse_into(
         self, expression_type: exp.IntoType, sql: str, **opts
     ) -> t.List[t.Optional[exp.Expression]]:
+        sql = preprocess_doris_date_trunc_order(sql)
         sql = preprocess_date_cast_syntax(sql)
         sql = preprocess_negative_interval(sql)
         return super().parse_into(expression_type, sql, **opts)
