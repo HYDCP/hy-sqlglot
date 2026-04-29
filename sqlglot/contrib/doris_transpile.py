@@ -1061,6 +1061,34 @@ def add_if_exists_to_drop_table(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def add_if_not_exists_to_create_table(expression: exp.Expression) -> exp.Expression:
+    """
+    Add IF NOT EXISTS to CREATE TABLE statements.
+
+    Doris accepts ``CREATE TABLE IF NOT EXISTS`` and this makes generated
+    migration SQL idempotent when the source PostgreSQL statement omitted the
+    guard. Other CREATE kinds (VIEW, INDEX, etc.) are intentionally left
+    unchanged.
+
+    Before (PostgreSQL):
+        CREATE TABLE schema1.table1 (id INT);
+
+    After (Doris):
+        CREATE TABLE IF NOT EXISTS schema1.table1 (id INT);
+
+    Args:
+        expression: The AST to process
+
+    Returns:
+        The processed AST with IF NOT EXISTS added to CREATE TABLE statements
+    """
+    for create in expression.find_all(exp.Create):
+        if create.kind == "TABLE" and not create.args.get("exists"):
+            create.set("exists", True)
+
+    return expression
+
+
 def _is_nextval_call(node: exp.Expression) -> bool:
     """Check if a node is a NEXTVAL(...) function call."""
     if isinstance(node, exp.Anonymous):
@@ -2885,6 +2913,7 @@ def transpile_to_doris(
     convert_date_formats: bool = True,
     auto_add_delete_where: bool = True,
     auto_add_drop_table_if_exists: bool = True,
+    auto_add_create_table_if_not_exists: bool = True,
     convert_date_arith: bool = True,
     convert_compound_interval: bool = True,
     normalize_date_trunc: bool = True,
@@ -2942,6 +2971,12 @@ def transpile_to_doris(
             - DROP TABLE t -> DROP TABLE IF EXISTS t
             - Does not affect DROP VIEW, DROP INDEX, or statements that already
               include IF EXISTS
+        auto_add_create_table_if_not_exists: Whether to auto-add IF NOT EXISTS
+            to CREATE TABLE statements (default True)
+            - Makes generated migration SQL idempotent for Doris
+            - CREATE TABLE t (...) -> CREATE TABLE IF NOT EXISTS t (...)
+            - Does not affect CREATE VIEW, CREATE INDEX, or statements that
+              already include IF NOT EXISTS
         convert_date_arith: Whether to convert date +/- integer to DATE_ADD with INTERVAL (default True)
             - Doris doesn't support date - 1 syntax
             - date - 1 -> DATE_ADD(date, INTERVAL -1 DAY)
@@ -3129,6 +3164,10 @@ def transpile_to_doris(
             if auto_add_drop_table_if_exists:
                 normalized = add_if_exists_to_drop_table(normalized)
 
+            # Add IF NOT EXISTS to CREATE TABLE statements for idempotent Doris DDL
+            if auto_add_create_table_if_not_exists:
+                normalized = add_if_not_exists_to_create_table(normalized)
+
             # Convert date arithmetic (date +/- integer) to DATE_ADD with INTERVAL
             if convert_date_arith:
                 normalized = convert_date_arithmetic(normalized)
@@ -3302,6 +3341,7 @@ __all__ = [
     "convert_date_format_patterns",
     "add_where_to_delete",
     "add_if_exists_to_drop_table",
+    "add_if_not_exists_to_create_table",
     "convert_date_arithmetic",
     "expand_compound_interval",
     "normalize_date_trunc_unit",
