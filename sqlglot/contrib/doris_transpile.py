@@ -884,8 +884,9 @@ def normalize_table_identifiers(
             table_ref = column.args.get("table")
             if isinstance(table_ref, exp.Identifier) and not table_ref.quoted:
                 original = table_ref.this
-                if original in alias_mapping:
-                    table_ref.set("this", alias_mapping[original])
+                normalized_ref = alias_mapping.get(original) or alias_mapping.get(original.lower())
+                if normalized_ref is not None:
+                    table_ref.set("this", normalized_ref)
 
     return expression
 

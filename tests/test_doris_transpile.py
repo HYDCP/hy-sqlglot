@@ -57,6 +57,186 @@ def run_test(name: str, sql: str, expected_behavior: str = None):
     return original, normalized
 
 
+def test_drop_table_if_exists_transform():
+    """DROP TABLE gets IF EXISTS without affecting other DROP kinds."""
+    assert pg_to_doris("DROP TABLE public.T1")[0] == "DROP TABLE IF EXISTS public.t1"
+    assert (
+        pg_to_doris("DROP TABLE IF EXISTS public.T1")[0]
+        == "DROP TABLE IF EXISTS public.t1"
+    )
+    assert (
+        pg_to_doris("DROP TABLE public.T1 CASCADE")[0]
+        == "DROP TABLE IF EXISTS public.t1 CASCADE"
+    )
+    assert pg_to_doris("DROP VIEW public.V1")[0] == "DROP VIEW public.v1"
+    assert (
+        transpile_to_doris(
+            "DROP TABLE public.T1",
+            read="postgres",
+            auto_add_drop_table_if_exists=False,
+        )[0]
+        == "DROP TABLE public.t1"
+    )
+
+
+def test_nextval_rewrite_insert_union_all():
+    """NEXTVAL is rewritten in each SELECT arm of INSERT ... UNION ALL."""
+    sql = """
+    INSERT INTO target (id)
+    SELECT NEXTVAL() AS id FROM t WHERE a = 1
+    UNION ALL
+    SELECT NEXTVAL() AS id FROM u WHERE xx = 1
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "INSERT INTO target (id) SELECT NULL AS id FROM t WHERE a = 1 "
+        "UNION ALL SELECT NULL AS id FROM u WHERE xx = 1"
+    )
+
+
+def test_nextval_rewrite_insert_union_distinct_is_left_unchanged():
+    """Plain UNION is not rewritten because distinctness can depend on NEXTVAL."""
+    sql = """
+    INSERT INTO target (id)
+    SELECT NEXTVAL() AS id FROM t
+    UNION
+    SELECT NEXTVAL() AS id FROM u
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "INSERT INTO target (id) SELECT NEXTVAL() AS id FROM t "
+        "UNION SELECT NEXTVAL() AS id FROM u"
+    )
+
+
+def test_nextval_rewrite_insert_select_with_left_join():
+    """JOIN sources do not affect top-level NEXTVAL rewrites."""
+    sql = """
+    INSERT INTO target (id, name)
+    SELECT NEXTVAL() AS id, a.name
+    FROM a
+    LEFT JOIN b ON a.id = b.a_id
+    WHERE b.flag = 1
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "INSERT INTO target (id, `name`) SELECT NULL AS id, a.`name` "
+        "FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.flag = 1"
+    )
+
+
+def test_table_alias_reference_uses_case_insensitive_lookup():
+    """Mixed-case references should resolve to the normalized table alias."""
+    sql = "SELECT * FROM t1 T1 LEFT JOIN db.tb tt ON T1.Dpst = Tt. Dpst"
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT * FROM t1 AS t1 LEFT JOIN db.tb AS tt ON t1.Dpst = tt.Dpst"
+    )
+
+
+def test_quoted_table_alias_keeps_case():
+    """Quoted table aliases are explicit and should not be case-normalized."""
+    assert (
+        pg_to_doris('SELECT "T1".id FROM t "T1"')[0]
+        == "SELECT `T1`.id FROM t AS `T1`"
+    )
+
+
+def test_table_alias_normalization_preserves_column_case():
+    """Only table qualifiers are normalized; column identifiers keep their case."""
+    assert (
+        pg_to_doris("SELECT T.ColName FROM MyTable T")[0]
+        == "SELECT t.ColName FROM mytable AS t"
+    )
+
+
+def test_table_alias_references_normalize_across_clauses():
+    """Mixed-case table qualifiers normalize consistently outside JOIN clauses."""
+    sql = "SELECT T.Id FROM Foo T WHERE t.Id > 0 GROUP BY T.Id ORDER BY t.Id"
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.Id FROM foo AS t WHERE t.Id > 0 GROUP BY t.Id ORDER BY t.Id"
+    )
+
+
+def test_nextval_rewrite_insert_select_from_union_subquery():
+    """A UNION inside FROM does not block outer SELECT-list NEXTVAL rewrites."""
+    sql = """
+    INSERT INTO target (id)
+    SELECT NEXTVAL() AS id
+    FROM (
+        SELECT x FROM t WHERE a = 1
+        UNION
+        SELECT x FROM u WHERE xx = 1
+    ) s
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "INSERT INTO target (id) SELECT NULL AS id FROM (SELECT x FROM t "
+        "WHERE a = 1 UNION SELECT x FROM u WHERE xx = 1) AS s"
+    )
+
+
+def test_nextval_rewrite_insert_union_all_with_left_join():
+    """JOIN sources do not affect top-level NEXTVAL rewrites in UNION arms."""
+    sql = """
+    INSERT INTO target (id, name)
+    SELECT NEXTVAL() AS id, a.name
+    FROM a
+    LEFT JOIN b ON a.id = b.a_id
+    WHERE b.flag = 1
+    UNION ALL
+    SELECT NEXTVAL() AS id, c.name
+    FROM c
+    LEFT JOIN d ON c.id = d.c_id
+    WHERE d.flag = 1
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "INSERT INTO target (id, `name`) SELECT NULL AS id, a.`name` "
+        "FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.flag = 1 UNION ALL "
+        "SELECT NULL AS id, c.`name` FROM c LEFT JOIN d ON c.id = d.c_id "
+        "WHERE d.flag = 1"
+    )
+
+
+def test_pg_to_date_drops_format_argument_for_doris():
+    """PostgreSQL TO_DATE(value, format) maps to Doris TO_DATE(value)."""
+    assert (
+        pg_to_doris("SELECT to_date('20240101', 'yyyymmdd') AS data_dt")[0]
+        == "SELECT TO_DATE('20240101') AS data_dt"
+    )
+    assert (
+        pg_to_doris("SELECT TO_DATE(col, 'YYYYMMDD') AS data_dt FROM t")[0]
+        == "SELECT TO_DATE(col) AS data_dt FROM t"
+    )
+
+
+def test_str_to_date_keeps_format_argument_for_doris():
+    """STR_TO_DATE keeps its format argument and existing format conversion."""
+    assert (
+        pg_to_doris("SELECT str_to_date('20240101', 'yyyyMMdd') AS data_dt")[0]
+        == "SELECT STR_TO_DATE('20240101', '%Y%m%d') AS data_dt"
+    )
+
+
+def run_drop_table_if_exists_tests():
+    """Run DROP TABLE IF EXISTS compatibility checks."""
+    print("\n\n" + "="*70)
+    print(" DROP TABLE IF EXISTS Tests")
+    print("="*70)
+
+    test_drop_table_if_exists_transform()
+    print("✅ DROP TABLE adds IF EXISTS, CASCADE is preserved")
+
+
 def run_all_tests():
     """Run all test cases"""
 
@@ -781,7 +961,7 @@ def run_summary():
     print(" Test Summary")
     print("="*70)
     print("""
-Feature Overview (9 automatic conversions):
+Feature Overview (10 automatic conversions):
   1. Table/alias case normalization - Unifies T.id and t.id to t.id
   2. CAST auto-alias - Prevents __cast_0 column names
   3. UNNEST → LATERAL VIEW - Converts PostgreSQL UNNEST syntax
@@ -791,6 +971,7 @@ Feature Overview (9 automatic conversions):
   7. Preserve ASCII function - Keeps ASCII() instead of ORD(CONVERT(...))
   8. Convert date formats - Java format (yyyyMMdd) → MySQL format (%Y%m%d)
   9. Normalize E-strings - Fixes PostgreSQL E-string quotes
+  10. DROP TABLE IF EXISTS - Adds idempotent IF EXISTS guard
 
 Usage:
   from sqlglot.contrib.doris_transpile import transpile_to_doris
@@ -832,6 +1013,9 @@ Key Conversions:
   
   - E-String:            regexp_replace(col, E'/', ',')
                       → REGEXP_REPLACE(col, '/', ',')
+
+  - DROP TABLE:          DROP TABLE t
+                      → DROP TABLE IF EXISTS t
 """)
 
 
@@ -855,6 +1039,7 @@ if __name__ == "__main__":
     run_ascii_preserve_tests()
     run_date_format_tests()
     run_estring_tests()
+    run_drop_table_if_exists_tests()
 
     # Output summary
     run_summary()
