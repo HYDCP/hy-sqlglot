@@ -81,6 +81,11 @@ class DorisTranspileGenerator(Doris.Generator):
        use Doris' native NULL ordering, no rewriting).
     """
 
+    UNWRAPPED_INTERVAL_VALUES = Doris.Generator.UNWRAPPED_INTERVAL_VALUES + (
+        exp.Cast,
+        exp.Mul,
+    )
+
     def __init__(self, *args: t.Any, preserve_pg_null_order: bool = False,
                  **kwargs: t.Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1660,6 +1665,88 @@ def expand_compound_interval(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def _is_one_interval_value(expression: exp.Expression) -> bool:
+    return (
+        isinstance(expression, exp.Literal)
+        and expression.this == "1"
+        and expression.this.lstrip("+-").isdigit()
+    )
+
+
+def _flatten_mul_factors(expression: exp.Expression) -> t.List[exp.Expression]:
+    if isinstance(expression, exp.Mul):
+        return _flatten_mul_factors(expression.this) + _flatten_mul_factors(
+            expression.expression
+        )
+
+    if isinstance(expression, exp.Paren) and isinstance(expression.this, exp.Mul):
+        return _flatten_mul_factors(expression.this)
+
+    return [expression]
+
+
+def _build_mul_chain(factors: t.List[exp.Expression]) -> exp.Expression:
+    chain = factors[0]
+    for factor in factors[1:]:
+        chain = exp.Mul(this=chain, expression=factor)
+    return chain
+
+
+def fold_interval_multiplication(expression: exp.Expression) -> exp.Expression:
+    """
+    Move scalar multiplication into Doris ``INTERVAL <expr> <unit>`` syntax.
+
+    PostgreSQL accepts ``INTERVAL '1 month' * n`` and ``n * INTERVAL '1 month'``.
+    Doris rejects the external multiplication but accepts an expression as the
+    interval amount, so we rewrite the multiplication chain in-place.
+
+    Examples:
+        INTERVAL '1 month' * avg_stability_time::int
+            -> INTERVAL CAST(avg_stability_time AS INT) MONTH
+
+        a * b * INTERVAL '1 month'
+            -> INTERVAL a * b MONTH
+    """
+    for mul in list(expression.find_all(exp.Mul)):
+        parent = mul.parent
+        if isinstance(parent, exp.Mul):
+            continue
+
+        if isinstance(parent, exp.Paren) and isinstance(parent.parent, exp.Mul):
+            continue
+
+        factors = _flatten_mul_factors(mul)
+        interval_factors = [
+            factor for factor in factors if isinstance(factor, exp.Interval)
+        ]
+        if len(interval_factors) != 1:
+            continue
+
+        interval = interval_factors[0]
+        if not interval.unit or not interval.this:
+            continue
+
+        amount_factors: t.List[exp.Expression] = []
+        for factor in factors:
+            if factor is interval:
+                if not _is_one_interval_value(interval.this):
+                    amount_factors.append(interval.this.copy())
+            else:
+                amount_factors.append(factor.copy())
+
+        if not amount_factors:
+            continue
+
+        amount = (
+            amount_factors[0]
+            if len(amount_factors) == 1
+            else _build_mul_chain(amount_factors)
+        )
+        mul.replace(exp.Interval(this=amount, unit=interval.unit.copy()))
+
+    return expression
+
+
 # --------------------------------------------------------------------------- #
 # DATE_TRUNC unit normalization (PG plural -> Doris singular)
 # --------------------------------------------------------------------------- #
@@ -3177,8 +3264,11 @@ def transpile_to_doris(
             # into single-unit INTERVALs joined by +/-. Must run AFTER
             # convert_date_arithmetic, which itself can introduce single-unit
             # INTERVAL nodes that this transform must leave untouched.
+            # Also fold scalar interval multiplication into Doris'
+            # INTERVAL <expr> UNIT form.
             if convert_compound_interval:
                 normalized = expand_compound_interval(normalized)
+                normalized = fold_interval_multiplication(normalized)
 
             # Normalize DATE_TRUNC unit names to Doris singular forms
             # (PG accepts plurals like 'months'/'days'; Doris does not).

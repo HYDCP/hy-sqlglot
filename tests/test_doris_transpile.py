@@ -227,6 +227,24 @@ def test_str_to_date_keeps_format_argument_for_doris():
     )
 
 
+def test_interval_multiplication_folds_into_interval_amount():
+    """Doris accepts interval amount expressions, not external interval multiplication."""
+    assert (
+        pg_to_doris(
+            "SELECT INTERVAL '1 Month' * avg_stability_time::int AS stability FROM t"
+        )[0]
+        == "SELECT INTERVAL CAST(avg_stability_time AS INT) MONTH AS stability FROM t"
+    )
+    assert (
+        pg_to_doris("SELECT CURRENT_DATE + (a * b * INTERVAL '1 month') FROM t")[0]
+        == "SELECT CURRENT_DATE + (INTERVAL a * b MONTH) FROM t"
+    )
+    assert (
+        pg_to_doris("SELECT CURRENT_DATE + (INTERVAL '2 months' * a) FROM t")[0]
+        == "SELECT CURRENT_DATE + (INTERVAL 2 * a MONTH) FROM t"
+    )
+
+
 def run_drop_table_if_exists_tests():
     """Run DROP TABLE IF EXISTS compatibility checks."""
     print("\n\n" + "="*70)
