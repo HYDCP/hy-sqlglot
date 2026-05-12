@@ -2928,6 +2928,23 @@ def preprocess_negative_interval(sql: str) -> str:
     return _INTERVAL_PREPROCESS_RE.sub(_sub, sql)
 
 
+_DELETE_TRAILING_FORCE_RE = re.compile(
+    r"^(\s*DELETE\b.*?)(\s+FORCE)(\s*;?\s*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def preprocess_delete_trailing_force(sql: str) -> str:
+    """
+    Remove unsupported trailing ``FORCE`` from PostgreSQL-style DELETE.
+
+    Doris rejects ``DELETE ... WHERE ... FORCE`` with a parse error. Strip only
+    a standalone ``FORCE`` token at the end of a DELETE statement, before the
+    PostgreSQL parser sees it.
+    """
+    return _DELETE_TRAILING_FORCE_RE.sub(r"\1\3", sql)
+
+
 def preprocess_date_cast_syntax(sql: str) -> str:
     """
     Preprocess SQL to rewrite DATE'...'::type into CAST(DATE '...' AS type).
@@ -2987,6 +3004,7 @@ class PostgresDoris(Postgres):
 
     def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_doris_date_trunc_order(sql)
+        sql = preprocess_delete_trailing_force(sql)
         sql = preprocess_date_cast_syntax(sql)
         sql = preprocess_negative_interval(sql)
         return super().parse(sql, **opts)
@@ -2995,6 +3013,7 @@ class PostgresDoris(Postgres):
         self, expression_type: exp.IntoType, sql: str, **opts
     ) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_doris_date_trunc_order(sql)
+        sql = preprocess_delete_trailing_force(sql)
         sql = preprocess_date_cast_syntax(sql)
         sql = preprocess_negative_interval(sql)
         return super().parse_into(expression_type, sql, **opts)
@@ -3472,6 +3491,7 @@ __all__ = [
     "convert_age_in_extract",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
+    "preprocess_delete_trailing_force",
     "preprocess_negative_interval",
     "transpile_to_doris",
     "pg_to_doris",

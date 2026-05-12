@@ -272,6 +272,30 @@ def test_numeric_trunc_rewrites_to_truncate_for_doris():
     )
 
 
+def test_delete_trailing_force_is_removed_for_doris():
+    """Doris does not support trailing FORCE on DELETE statements."""
+    assert (
+        pg_to_doris("DELETE FROM xxx.xxx WHERE data_data = 'xxx' FORCE")[0]
+        == "DELETE FROM xxx.xxx WHERE data_data = 'xxx'"
+    )
+    assert (
+        pg_to_doris("DELETE FROM xxx.xxx WHERE data_data = 'xxx' FORCE;")[0]
+        == "DELETE FROM xxx.xxx WHERE data_data = 'xxx'"
+    )
+    assert (
+        pg_to_doris("DELETE FROM xxx.xxx WHERE data_data = 'FORCE' FORCE")[0]
+        == "DELETE FROM xxx.xxx WHERE data_data = 'FORCE'"
+    )
+    assert (
+        pg_to_doris("DELETE FROM xxx.xxx WHERE data_data = 'FORCE'")[0]
+        == "DELETE FROM xxx.xxx WHERE data_data = 'FORCE'"
+    )
+    assert (
+        pg_to_doris("SELECT 'FORCE' AS force_value")[0]
+        == "SELECT 'FORCE' AS force_value"
+    )
+
+
 def run_drop_table_if_exists_tests():
     """Run DROP TABLE IF EXISTS compatibility checks."""
     print("\n\n" + "="*70)
