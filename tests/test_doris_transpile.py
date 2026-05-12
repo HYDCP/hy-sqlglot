@@ -245,6 +245,33 @@ def test_interval_multiplication_folds_into_interval_amount():
     )
 
 
+def test_numeric_trunc_rewrites_to_truncate_for_doris():
+    """Doris exposes numeric truncation as TRUNCATE(...), not TRUNC(...)."""
+    assert (
+        pg_to_doris(
+            "SELECT trunc((coalesce(index_value, 0) - coalesce(base_value, 0)), 1) "
+            "AS diff_value FROM t"
+        )[0]
+        == "SELECT TRUNCATE((COALESCE(index_value, 0) - COALESCE(base_value, 0)), 1) "
+        "AS diff_value FROM t"
+    )
+    assert (
+        pg_to_doris("SELECT trunc(amount) AS amount_trunc FROM t")[0]
+        == "SELECT TRUNCATE(amount) AS amount_trunc FROM t"
+    )
+    assert (
+        pg_to_doris("SELECT date_trunc('month', dt) AS m FROM t")[0]
+        == "SELECT DATE_TRUNC(dt, 'MONTH') AS m FROM t"
+    )
+    assert (
+        pg_to_doris(
+            "SELECT trunc(amount, 1) AS amount_trunc FROM t",
+            convert_numeric_trunc=False,
+        )[0]
+        == "SELECT TRUNC(amount, 1) AS amount_trunc FROM t"
+    )
+
+
 def run_drop_table_if_exists_tests():
     """Run DROP TABLE IF EXISTS compatibility checks."""
     print("\n\n" + "="*70)

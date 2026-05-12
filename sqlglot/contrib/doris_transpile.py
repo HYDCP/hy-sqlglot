@@ -1748,6 +1748,26 @@ def fold_interval_multiplication(expression: exp.Expression) -> exp.Expression:
 
 
 # --------------------------------------------------------------------------- #
+# Numeric TRUNC function compatibility (PostgreSQL/Oracle → Doris)
+# --------------------------------------------------------------------------- #
+
+def rewrite_numeric_trunc_to_truncate(expression: exp.Expression) -> exp.Expression:
+    """
+    Rename numeric ``TRUNC(...)`` calls to Doris' ``TRUNCATE(...)`` function.
+
+    PostgreSQL accepts ``TRUNC(number [, scale])``. Doris does not provide a
+    ``TRUNC`` function, but its ``TRUNCATE(number [, scale])`` has the same
+    numeric truncation role. ``DATE_TRUNC`` is represented by a different AST
+    node and is intentionally unaffected.
+    """
+    for node in expression.find_all(exp.Anonymous):
+        if node.name.upper() == "TRUNC":
+            node.set("this", "TRUNCATE")
+
+    return expression
+
+
+# --------------------------------------------------------------------------- #
 # DATE_TRUNC unit normalization (PG plural -> Doris singular)
 # --------------------------------------------------------------------------- #
 
@@ -3010,6 +3030,7 @@ def transpile_to_doris(
     expand_like_any_all: bool = True,
     convert_to_char_numeric: bool = True,
     convert_age: bool = True,
+    convert_numeric_trunc: bool = True,
     preserve_pg_null_order: bool = False,
     nextval_to_default: bool = True,
     drop_sequences: t.Optional[bool] = None,
@@ -3146,6 +3167,9 @@ def transpile_to_doris(
               silently emitting a string with different semantics
             - Unsupported EXTRACT units inside AGE() are left untouched and
               logged at warning level
+        convert_numeric_trunc: Whether to rewrite numeric ``TRUNC(...)`` calls
+            to Doris' ``TRUNCATE(...)`` (default True). ``DATE_TRUNC`` is
+            handled separately and is not affected.
         preserve_pg_null_order: Whether to faithfully preserve PostgreSQL's default
             NULL ordering when transpiling ORDER BY clauses (default False).
             PG defaults to ASC NULLS LAST / DESC NULLS FIRST, while Doris does
@@ -3303,6 +3327,11 @@ def transpile_to_doris(
             # intentionally left alone so Doris flags it as unsupported.
             if convert_age:
                 normalized = convert_age_in_extract(normalized)
+
+            # Doris uses TRUNCATE(...) for numeric truncation; TRUNC(...) is
+            # not registered. DATE_TRUNC is a separate expression type.
+            if convert_numeric_trunc:
+                normalized = rewrite_numeric_trunc_to_truncate(normalized)
 
             # Replace top-level NEXTVAL(...) inside INSERT statements with the
             # DEFAULT keyword so Doris' AUTO_INCREMENT column fills the value.
