@@ -207,6 +207,93 @@ def test_nextval_rewrite_insert_union_all_with_left_join():
     )
 
 
+def test_cross_join_lateral_unnest_rewrites_to_lateral_view():
+    """Doris accepts LATERAL VIEW, not PostgreSQL CROSS JOIN LATERAL UNNEST."""
+    sql = """
+    SELECT t.id, x.tag
+    FROM t
+    CROSS JOIN LATERAL unnest(string_to_array(t.tags, ',')) AS x(tag)
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.tag FROM t "
+        "LATERAL VIEW EXPLODE(SPLIT_BY_STRING(t.tags, ',')) x AS tag"
+    )
+
+
+def test_cross_join_lateral_unnest_subquery_rewrites_to_lateral_view():
+    """A simple LATERAL subquery wrapping UNNEST maps to one Doris LATERAL VIEW."""
+    sql = """
+    SELECT t.id, x.tag
+    FROM t
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(t.tags, ',')) AS tag
+    ) x
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.tag FROM t "
+        "LATERAL VIEW EXPLODE(SPLIT_BY_STRING(t.tags, ',')) x AS tag"
+    )
+
+
+def test_cross_join_lateral_regexp_split_rewrites_to_lateral_view():
+    """FROM LATERAL REGEXP_SPLIT_TO_TABLE should use Doris LATERAL VIEW."""
+    sql = """
+    SELECT t.id, x.tag
+    FROM t
+    CROSS JOIN LATERAL regexp_split_to_table(t.tags, ',') AS x(tag)
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.tag FROM t "
+        "LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(t.tags, ',')) x AS tag"
+    )
+
+
+def test_cross_join_lateral_uncorrelated_subquery_drops_lateral_keyword():
+    """Uncorrelated LATERAL subqueries keep CROSS JOIN semantics without LATERAL."""
+    sql = "SELECT t.id, x.v FROM t CROSS JOIN LATERAL (SELECT 1 AS v) x"
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.v FROM t CROSS JOIN (SELECT 1 AS v) AS x"
+    )
+
+
+def test_cross_join_lateral_correlated_values_rewrites_to_lateral_view_array():
+    """Single-column correlated VALUES can expand through Doris EXPLODE(ARRAY(...))."""
+    sql = """
+    SELECT t.id, x.v
+    FROM t
+    CROSS JOIN LATERAL (VALUES (t.id + 1), (t.id + 2)) AS x(v)
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.v FROM t "
+        "LATERAL VIEW EXPLODE(ARRAY(t.id + 1, t.id + 2)) x AS v"
+    )
+
+
+def test_cross_join_lateral_uncorrelated_multicolumn_values_uses_union_aliases():
+    """Uncorrelated multi-column VALUES should avoid Doris-unsupported alias lists."""
+    sql = """
+    SELECT t.id, x.a, x.b
+    FROM t
+    CROSS JOIN LATERAL (VALUES (1, 'a'), (2, 'b')) AS x(a, b)
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT t.id, x.a, x.b FROM t CROSS JOIN "
+        "(SELECT 1 AS a, 'a' AS b UNION ALL SELECT 2 AS a, 'b' AS b) AS x"
+    )
+
+
 def test_pg_to_date_drops_format_argument_for_doris():
     """PostgreSQL TO_DATE(value, format) maps to Doris TO_DATE(value)."""
     assert (

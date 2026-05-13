@@ -349,6 +349,318 @@ def _transform_select_explode(select: exp.Select) -> None:
         select.set("laterals", existing_laterals + laterals_to_add)
 
 
+def rewrite_cross_join_lateral_for_doris(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite PostgreSQL ``CROSS JOIN LATERAL`` shapes Doris can support.
+
+    Doris rejects PostgreSQL's general ``CROSS JOIN LATERAL`` syntax, but it
+    does support Hive-style ``LATERAL VIEW EXPLODE(...)`` for row-expanding
+    functions. This transform handles the proven-safe cases:
+
+    - ``CROSS JOIN LATERAL unnest(...) AS x(col)`` -> ``LATERAL VIEW EXPLODE(...) x AS col``
+    - ``CROSS JOIN LATERAL regexp_split_to_table(...) AS x(col)`` -> ``LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(...)) x AS col``
+    - Uncorrelated lateral subqueries -> ordinary ``CROSS JOIN`` subqueries.
+
+    Complex correlated lateral subqueries are intentionally left untouched:
+    Doris has no equivalent general lateral-subquery operator, and flattening
+    them can change cardinality or filtering semantics.
+    """
+    for select in list(expression.find_all(exp.Select)):
+        _rewrite_select_cross_join_lateral(select)
+
+    return expression
+
+
+def _rewrite_select_cross_join_lateral(select: exp.Select) -> None:
+    joins = list(select.args.get("joins") or [])
+    if not joins:
+        return
+
+    new_joins = []
+    laterals_to_add = []
+    left_aliases = _select_initial_source_aliases(select)
+
+    for join in joins:
+        join_source = join.this
+        if not isinstance(join_source, exp.Lateral) or join_source.args.get("view"):
+            new_joins.append(join)
+            left_aliases.update(_source_alias_names(join_source))
+            continue
+
+        if not _is_cross_lateral_join(join):
+            new_joins.append(join)
+            left_aliases.update(_source_alias_names(join_source))
+            continue
+
+        lateral_view = _cross_lateral_join_to_lateral_view(join_source)
+        if lateral_view is not None:
+            laterals_to_add.append(lateral_view)
+            left_aliases.update(_source_alias_names(lateral_view))
+            continue
+
+        if _drop_uncorrelated_lateral_subquery(join, join_source, left_aliases):
+            new_joins.append(join)
+            left_aliases.update(_source_alias_names(join.this))
+            continue
+
+        logger.warning(
+            "Doris 不支持复杂相关 CROSS JOIN LATERAL，自动改写未覆盖此形态，保留原样: %s",
+            _short_sql(join_source),
+        )
+        new_joins.append(join)
+        left_aliases.update(_source_alias_names(join_source))
+
+    select.set("joins", new_joins)
+    if laterals_to_add:
+        existing_laterals = select.args.get("laterals") or []
+        select.set("laterals", existing_laterals + laterals_to_add)
+
+
+def _is_cross_lateral_join(join: exp.Join) -> bool:
+    kind = join.args.get("kind")
+    if kind is not None and str(kind).upper() != "CROSS":
+        return False
+    return not join.args.get("on") and not join.args.get("using")
+
+
+def _cross_lateral_join_to_lateral_view(lateral: exp.Lateral) -> t.Optional[exp.Lateral]:
+    alias_parts = _lateral_alias_parts(lateral)
+    if alias_parts is None:
+        return None
+
+    table_alias_name, default_column_alias = alias_parts
+    source = lateral.this
+    explode_source, column_alias = _lateral_view_source_and_column(
+        source,
+        default_column_alias,
+    )
+    if explode_source is None:
+        return None
+
+    return exp.Lateral(
+        this=explode_source,
+        view=True,
+        alias=exp.TableAlias(
+            this=exp.to_identifier(table_alias_name),
+            columns=[exp.to_identifier(column_alias or default_column_alias)],
+        ),
+    )
+
+
+def _lateral_alias_parts(lateral: exp.Lateral) -> t.Optional[t.Tuple[str, str]]:
+    alias = lateral.args.get("alias")
+    if not isinstance(alias, exp.TableAlias) or not alias.name:
+        return None
+
+    columns = alias.args.get("columns") or []
+    column_alias = columns[0].name if columns and columns[0].name else alias.name
+    return alias.name, column_alias
+
+
+def _lateral_view_source_and_column(
+    source: exp.Expression,
+    default_column_alias: str,
+) -> t.Tuple[t.Optional[exp.Expression], str]:
+    if isinstance(source, exp.Subquery):
+        subquery_source = source.this
+        if isinstance(subquery_source, exp.Values):
+            values_array = _single_column_values_array(subquery_source)
+            if values_array is None:
+                return None, default_column_alias
+            return exp.Explode(this=values_array), default_column_alias
+
+        select = subquery_source
+        if not isinstance(select, exp.Select) or not _is_simple_lateral_table_function_select(select):
+            return None, default_column_alias
+
+        projection = select.expressions[0]
+        if isinstance(projection, exp.Alias):
+            return _lateral_view_source_and_column(projection.this, projection.alias)
+        return _lateral_view_source_and_column(projection, default_column_alias)
+
+    if isinstance(source, exp.Unnest):
+        if len(source.expressions) != 1:
+            return None, default_column_alias
+        return exp.Explode(this=source.expressions[0].copy()), default_column_alias
+
+    if isinstance(source, (exp.Explode, exp.Posexplode)):
+        return source.copy(), default_column_alias
+
+    if isinstance(source, exp.Anonymous) and source.name.upper() == "REGEXP_SPLIT_TO_TABLE":
+        return (
+            exp.Explode(
+                this=exp.Anonymous(
+                    this="SPLIT_BY_REGEXP",
+                    expressions=[arg.copy() for arg in source.expressions],
+                )
+            ),
+            default_column_alias,
+        )
+
+    return None, default_column_alias
+
+
+def _single_column_values_array(values: exp.Values) -> t.Optional[exp.Expression]:
+    rows = _values_tuple_rows(values)
+    if rows is None or any(len(row) != 1 for row in rows):
+        return None
+
+    return exp.Anonymous(this="ARRAY", expressions=[row[0].copy() for row in rows])
+
+
+def _values_tuple_rows(values: exp.Values) -> t.Optional[t.List[t.List[exp.Expression]]]:
+    rows = []
+    for row in values.expressions:
+        if not isinstance(row, exp.Tuple):
+            return None
+        rows.append(list(row.expressions))
+
+    if not rows:
+        return None
+
+    arity = len(rows[0])
+    if arity == 0 or any(len(row) != arity for row in rows):
+        return None
+
+    return rows
+
+
+def _is_simple_lateral_table_function_select(select: exp.Select) -> bool:
+    if len(select.expressions) != 1:
+        return False
+
+    unsafe_clauses = (
+        "from",
+        "joins",
+        "where",
+        "group",
+        "having",
+        "qualify",
+        "order",
+        "limit",
+        "offset",
+        "with",
+    )
+    return not any(select.args.get(key) for key in unsafe_clauses) and not select.args.get("distinct")
+
+
+def _drop_uncorrelated_lateral_subquery(
+    join: exp.Join,
+    lateral: exp.Lateral,
+    left_aliases: t.Set[str],
+) -> bool:
+    source = lateral.this
+    if not isinstance(source, exp.Subquery):
+        return False
+    if _lateral_subquery_has_outer_reference(source, left_aliases):
+        return False
+
+    values_replacement = _uncorrelated_values_subquery_without_column_alias_list(
+        source,
+        lateral,
+    )
+    if values_replacement is not None:
+        join.set("this", values_replacement)
+        return True
+
+    replacement = source.copy()
+    alias = lateral.args.get("alias")
+    if alias is not None and not replacement.args.get("alias"):
+        replacement.set("alias", alias.copy())
+    join.set("this", replacement)
+    return True
+
+
+def _uncorrelated_values_subquery_without_column_alias_list(
+    subquery: exp.Subquery,
+    lateral: exp.Lateral,
+) -> t.Optional[exp.Subquery]:
+    values = subquery.this
+    if not isinstance(values, exp.Values):
+        return None
+
+    rows = _values_tuple_rows(values)
+    alias = lateral.args.get("alias")
+    if rows is None or not isinstance(alias, exp.TableAlias) or not alias.name:
+        return None
+
+    columns = alias.args.get("columns") or []
+    column_names = [column.name for column in columns if column.name]
+    if len(column_names) != len(rows[0]):
+        return None
+
+    selects = []
+    for row in rows:
+        selects.append(
+            exp.Select(
+                expressions=[
+                    exp.alias_(value.copy(), column_name)
+                    for value, column_name in zip(row, column_names)
+                ]
+            )
+        )
+
+    union: exp.Expression = selects[0]
+    for select in selects[1:]:
+        union = exp.Union(this=union, expression=select, distinct=False)
+
+    return exp.Subquery(
+        this=union,
+        alias=exp.TableAlias(this=exp.to_identifier(alias.name)),
+    )
+
+
+def _lateral_subquery_has_outer_reference(
+    subquery: exp.Subquery,
+    left_aliases: t.Set[str],
+) -> bool:
+    select = subquery.this
+    local_aliases = _select_initial_source_aliases(select) if isinstance(select, exp.Select) else set()
+    if isinstance(select, exp.Select):
+        for join in select.args.get("joins") or []:
+            local_aliases.update(_source_alias_names(join.this))
+
+    for column in subquery.find_all(exp.Column):
+        table = column.table
+        if table:
+            table_name = table.lower()
+            if table_name in left_aliases and table_name not in local_aliases:
+                return True
+            continue
+
+        # A bare column in SELECT-without-FROM is necessarily resolved from the
+        # outer row in PostgreSQL LATERAL semantics.
+        if not local_aliases:
+            return True
+
+    return False
+
+
+def _select_initial_source_aliases(select: exp.Expression) -> t.Set[str]:
+    if not isinstance(select, exp.Select):
+        return set()
+
+    from_clause = select.args.get("from")
+    if from_clause is None:
+        return set()
+    return _source_alias_names(from_clause.this)
+
+
+def _source_alias_names(source: t.Optional[exp.Expression]) -> t.Set[str]:
+    if source is None:
+        return set()
+
+    alias_name = ""
+    if isinstance(source, exp.Lateral):
+        alias = source.args.get("alias")
+        if isinstance(alias, exp.TableAlias):
+            alias_name = alias.name
+    else:
+        alias_name = getattr(source, "alias_or_name", "") or getattr(source, "name", "")
+
+    return {alias_name.lower()} if alias_name else set()
+
+
 def regexp_split_to_table_to_lateral_view(expression: exp.Expression) -> exp.Expression:
     """
     Convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW EXPLODE(split_by_regexp(...)) syntax.
@@ -3036,6 +3348,7 @@ def transpile_to_doris(
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
     regexp_split_to_lateral: bool = True,
+    convert_cross_join_lateral: bool = True,
     preserve_ascii: bool = True,
     convert_date_formats: bool = True,
     auto_add_delete_where: bool = True,
@@ -3084,6 +3397,12 @@ def transpile_to_doris(
         regexp_split_to_lateral: Whether to convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW (default True)
             - SELECT REGEXP_SPLIT_TO_TABLE(col, ',') AS x -> SELECT tmp.x FROM ... LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(col, ',')) tmp AS x
             - PostgreSQL's REGEXP_SPLIT_TO_TABLE is not supported in Doris
+        convert_cross_join_lateral: Whether to rewrite safe PostgreSQL CROSS JOIN LATERAL
+            forms for Doris (default True)
+            - CROSS JOIN LATERAL unnest(...) AS x(col) -> LATERAL VIEW EXPLODE(...) x AS col
+            - CROSS JOIN LATERAL regexp_split_to_table(...) AS x(col) -> LATERAL VIEW EXPLODE(SPLIT_BY_REGEXP(...)) x AS col
+            - Uncorrelated lateral subqueries drop the LATERAL keyword; complex
+              correlated lateral subqueries are left unchanged with a warning
         preserve_ascii: Whether to preserve ASCII() function instead of converting to ORD(CONVERT(...)) (default True)
             - Doris natively supports ASCII(), no need for complex conversion
             - ORD(CONVERT(col USING utf32)) -> ASCII(col)
@@ -3276,6 +3595,11 @@ def transpile_to_doris(
             # Remove WITH DATA / WITH NO DATA clause from CREATE TABLE AS SELECT
             normalized = remove_with_data_clause(normalized)
 
+            # Rewrite PostgreSQL FROM-side CROSS JOIN LATERAL forms that Doris
+            # can express as LATERAL VIEW or ordinary uncorrelated CROSS JOINs.
+            if convert_cross_join_lateral:
+                normalized = rewrite_cross_join_lateral_for_doris(normalized)
+
             # Convert REGEXP_SPLIT_TO_TABLE to LATERAL VIEW (must be done before explode_to_lateral)
             if regexp_split_to_lateral:
                 normalized = regexp_split_to_table_to_lateral_view(normalized)
@@ -3388,6 +3712,7 @@ def pg_to_doris(
     auto_alias_cast: bool = True,
     explode_to_lateral: bool = True,
     regexp_split_to_lateral: bool = True,
+    convert_cross_join_lateral: bool = True,
     nextval_to_default: bool = True,
     drop_sequences: t.Optional[bool] = None,
     **opts,
@@ -3417,6 +3742,7 @@ def pg_to_doris(
         auto_alias_cast=auto_alias_cast,
         explode_to_lateral=explode_to_lateral,
         regexp_split_to_lateral=regexp_split_to_lateral,
+        convert_cross_join_lateral=convert_cross_join_lateral,
         nextval_to_default=nextval_to_default,
         drop_sequences=drop_sequences,
         **opts
@@ -3475,6 +3801,7 @@ __all__ = [
     "remove_with_data_clause",
     "fix_lateral_view_ambiguity",
     "explode_to_lateral_view",
+    "rewrite_cross_join_lateral_for_doris",
     "regexp_split_to_table_to_lateral_view",
     "preserve_ascii_function",
     "convert_date_format_patterns",
