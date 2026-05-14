@@ -392,8 +392,11 @@ def _rewrite_select_cross_join_lateral(select: exp.Select) -> None:
             left_aliases.update(_source_alias_names(join_source))
             continue
 
-        lateral_view = _cross_lateral_join_to_lateral_view(join_source)
-        if lateral_view is not None:
+        lateral_result = _cross_lateral_join_to_lateral_view(join_source)
+        if lateral_result is not None:
+            lateral_view, struct_fields = lateral_result
+            if struct_fields:
+                _expand_struct_star_projection(select, join_source.alias_or_name, struct_fields)
             laterals_to_add.append(lateral_view)
             left_aliases.update(_source_alias_names(lateral_view))
             continue
@@ -423,68 +426,91 @@ def _is_cross_lateral_join(join: exp.Join) -> bool:
     return not join.args.get("on") and not join.args.get("using")
 
 
-def _cross_lateral_join_to_lateral_view(lateral: exp.Lateral) -> t.Optional[exp.Lateral]:
+def _cross_lateral_join_to_lateral_view(
+    lateral: exp.Lateral,
+) -> t.Optional[t.Tuple[exp.Lateral, t.Optional[t.List[str]]]]:
     alias_parts = _lateral_alias_parts(lateral)
     if alias_parts is None:
         return None
 
-    table_alias_name, default_column_alias = alias_parts
+    table_alias_name, column_aliases = alias_parts
+    default_column_alias = column_aliases[0]
     source = lateral.this
-    explode_source, column_alias = _lateral_view_source_and_column(
+    explode_source, column_alias, struct_fields = _lateral_view_source_and_column(
         source,
         default_column_alias,
+        column_aliases,
+        table_alias_name,
     )
     if explode_source is None:
         return None
 
-    return exp.Lateral(
-        this=explode_source,
-        view=True,
-        alias=exp.TableAlias(
-            this=exp.to_identifier(table_alias_name),
-            columns=[exp.to_identifier(column_alias or default_column_alias)],
+    return (
+        exp.Lateral(
+            this=explode_source,
+            view=True,
+            alias=exp.TableAlias(
+                this=exp.to_identifier(table_alias_name),
+                columns=[exp.to_identifier(column_alias or default_column_alias)],
+            ),
         ),
+        struct_fields,
     )
 
 
-def _lateral_alias_parts(lateral: exp.Lateral) -> t.Optional[t.Tuple[str, str]]:
+def _lateral_alias_parts(lateral: exp.Lateral) -> t.Optional[t.Tuple[str, t.List[str]]]:
     alias = lateral.args.get("alias")
     if not isinstance(alias, exp.TableAlias) or not alias.name:
         return None
 
     columns = alias.args.get("columns") or []
-    column_alias = columns[0].name if columns and columns[0].name else alias.name
-    return alias.name, column_alias
+    column_aliases = [column.name for column in columns if column.name]
+    if not column_aliases:
+        column_aliases = [alias.name]
+    return alias.name, column_aliases
 
 
 def _lateral_view_source_and_column(
     source: exp.Expression,
     default_column_alias: str,
-) -> t.Tuple[t.Optional[exp.Expression], str]:
+    column_aliases: t.List[str],
+    table_alias_name: str,
+) -> t.Tuple[t.Optional[exp.Expression], str, t.Optional[t.List[str]]]:
     if isinstance(source, exp.Subquery):
         subquery_source = source.this
         if isinstance(subquery_source, exp.Values):
-            values_array = _single_column_values_array(subquery_source)
+            values_array, struct_fields = _values_array(subquery_source, column_aliases)
             if values_array is None:
-                return None, default_column_alias
-            return exp.Explode(this=values_array), default_column_alias
+                return None, default_column_alias, None
+            column_alias = table_alias_name if struct_fields else default_column_alias
+            return exp.Explode(this=values_array), column_alias, struct_fields
 
         select = subquery_source
         if not isinstance(select, exp.Select) or not _is_simple_lateral_table_function_select(select):
-            return None, default_column_alias
+            return None, default_column_alias, None
 
         projection = select.expressions[0]
         if isinstance(projection, exp.Alias):
-            return _lateral_view_source_and_column(projection.this, projection.alias)
-        return _lateral_view_source_and_column(projection, default_column_alias)
+            return _lateral_view_source_and_column(
+                projection.this,
+                projection.alias,
+                [projection.alias],
+                table_alias_name,
+            )
+        return _lateral_view_source_and_column(
+            projection,
+            default_column_alias,
+            column_aliases,
+            table_alias_name,
+        )
 
     if isinstance(source, exp.Unnest):
         if len(source.expressions) != 1:
-            return None, default_column_alias
-        return exp.Explode(this=source.expressions[0].copy()), default_column_alias
+            return None, default_column_alias, None
+        return exp.Explode(this=source.expressions[0].copy()), default_column_alias, None
 
     if isinstance(source, (exp.Explode, exp.Posexplode)):
-        return source.copy(), default_column_alias
+        return source.copy(), default_column_alias, None
 
     if isinstance(source, exp.Anonymous) and source.name.upper() == "REGEXP_SPLIT_TO_TABLE":
         return (
@@ -495,17 +521,72 @@ def _lateral_view_source_and_column(
                 )
             ),
             default_column_alias,
+            None,
         )
 
-    return None, default_column_alias
+    return None, default_column_alias, None
 
 
-def _single_column_values_array(values: exp.Values) -> t.Optional[exp.Expression]:
+def _values_array(
+    values: exp.Values,
+    column_aliases: t.List[str],
+) -> t.Tuple[t.Optional[exp.Expression], t.Optional[t.List[str]]]:
     rows = _values_tuple_rows(values)
-    if rows is None or any(len(row) != 1 for row in rows):
-        return None
+    if rows is None:
+        return None, None
 
-    return exp.Anonymous(this="ARRAY", expressions=[row[0].copy() for row in rows])
+    if all(len(row) == 1 for row in rows):
+        return (
+            exp.Anonymous(this="ARRAY", expressions=[row[0].copy() for row in rows]),
+            None,
+        )
+
+    if len(column_aliases) != len(rows[0]):
+        return None, None
+
+    structs = []
+    for row in rows:
+        struct_args = []
+        for column_alias, value in zip(column_aliases, row):
+            struct_args.extend([exp.Literal.string(column_alias), value.copy()])
+        structs.append(exp.Anonymous(this="NAMED_STRUCT", expressions=struct_args))
+
+    return exp.Anonymous(this="ARRAY", expressions=structs), column_aliases
+
+
+def _expand_struct_star_projection(
+    select: exp.Select,
+    alias_name: str,
+    struct_fields: t.List[str],
+) -> None:
+    if not alias_name:
+        return
+
+    new_expressions = []
+    modified = False
+    for expression in select.expressions:
+        if (
+            isinstance(expression, exp.Column)
+            and isinstance(expression.this, exp.Star)
+            and expression.table
+            and expression.table.lower() == alias_name.lower()
+        ):
+            new_expressions.extend(
+                exp.alias_(
+                    exp.Column(
+                        this=exp.to_identifier(field),
+                        table=exp.to_identifier(alias_name),
+                    ),
+                    field,
+                )
+                for field in struct_fields
+            )
+            modified = True
+            continue
+        new_expressions.append(expression)
+
+    if modified:
+        select.set("expressions", new_expressions)
 
 
 def _values_tuple_rows(values: exp.Values) -> t.Optional[t.List[t.List[exp.Expression]]]:

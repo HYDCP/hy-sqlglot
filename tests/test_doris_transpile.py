@@ -279,8 +279,8 @@ def test_cross_join_lateral_correlated_values_rewrites_to_lateral_view_array():
     )
 
 
-def test_cross_join_lateral_uncorrelated_multicolumn_values_uses_union_aliases():
-    """Uncorrelated multi-column VALUES should avoid Doris-unsupported alias lists."""
+def test_cross_join_lateral_multicolumn_values_rewrites_to_struct_explode():
+    """Multi-column VALUES expand as an array of named structs."""
     sql = """
     SELECT t.id, x.a, x.b
     FROM t
@@ -289,8 +289,33 @@ def test_cross_join_lateral_uncorrelated_multicolumn_values_uses_union_aliases()
 
     assert (
         pg_to_doris(sql)[0]
-        == "SELECT t.id, x.a, x.b FROM t CROSS JOIN "
-        "(SELECT 1 AS a, 'a' AS b UNION ALL SELECT 2 AS a, 'b' AS b) AS x"
+        == "SELECT t.id, x.a, x.b FROM t "
+        "LATERAL VIEW EXPLODE(ARRAY(NAMED_STRUCT('a', 1, 'b', 'a'), "
+        "NAMED_STRUCT('a', 2, 'b', 'b'))) x AS x"
+    )
+
+
+def test_cross_join_lateral_multicolumn_values_expands_star_projection():
+    """f.* should become explicit struct field projections after VALUES rewrite."""
+    sql = """
+    SELECT g.id, g.flag, g.title
+    FROM (
+        SELECT t.id, f.*
+        FROM t
+        CROSS JOIN LATERAL (
+            VALUES (t.flag1, 'title1'), (t.flag2, 'title2')
+        ) AS f(flag, title)
+    ) AS g
+    WHERE g.flag = '1'
+    """
+
+    assert (
+        pg_to_doris(sql)[0]
+        == "SELECT g.id, g.flag, g.title FROM (SELECT t.id, f.flag AS flag, "
+        "f.title AS title FROM t LATERAL VIEW EXPLODE(ARRAY("
+        "NAMED_STRUCT('flag', t.flag1, 'title', 'title1'), "
+        "NAMED_STRUCT('flag', t.flag2, 'title', 'title2'))) f AS f) AS g "
+        "WHERE g.flag = '1'"
     )
 
 
