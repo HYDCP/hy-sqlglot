@@ -357,6 +357,39 @@ def test_interval_multiplication_folds_into_interval_amount():
     )
 
 
+def test_date_part_day_date_diff_rewrites_to_datediff():
+    """PG interval-like date subtraction maps to Doris DATEDIFF."""
+    assert (
+        pg_to_doris(
+            "date_part('day', "
+            "date_trunc('year', DATE '2024-05-15') + '12 month' "
+            "- date_trunc('year', DATE '2023-05-15'))"
+        )[0]
+        == "DATEDIFF(DATE_TRUNC(CAST('2024-05-15' AS DATE), 'YEAR') "
+        "+ INTERVAL 12 MONTH, DATE_TRUNC(CAST('2023-05-15' AS DATE), 'YEAR'))"
+    )
+
+    assert (
+        pg_to_doris(
+            "SELECT date_part('DAY', "
+            "date_trunc('year', DATE '2024-05-15') + '12 MONth' "
+            "- date_trunc('year', DATE '2023-05-15')) AS days"
+        )[0]
+        == "SELECT DATEDIFF(DATE_TRUNC(CAST('2024-05-15' AS DATE), 'YEAR') "
+        "+ INTERVAL 12 MONTH, DATE_TRUNC(CAST('2023-05-15' AS DATE), 'YEAR')) AS days"
+    )
+
+    assert (
+        pg_to_doris(
+            "SELECT DATE_PART('day', "
+            "date_trunc('month', DATE '2024-05-15') "
+            "- date_trunc('MONth', DATE '2024-01-15')) AS days"
+        )[0]
+        == "SELECT DATEDIFF(DATE_TRUNC(CAST('2024-05-15' AS DATE), 'MONTH'), "
+        "DATE_TRUNC(CAST('2024-01-15' AS DATE), 'MONTH')) AS days"
+    )
+
+
 def test_numeric_trunc_rewrites_to_truncate_for_doris():
     """Doris exposes numeric truncation as TRUNCATE(...), not TRUNC(...)."""
     assert (

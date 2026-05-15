@@ -2140,6 +2140,90 @@ def fold_interval_multiplication(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def _extract_unit_name(unit_node: t.Optional[exp.Expression]) -> str:
+    if isinstance(unit_node, exp.Var):
+        return unit_node.name.upper()
+    if isinstance(unit_node, exp.Identifier):
+        return unit_node.this.upper()
+    if isinstance(unit_node, exp.Literal) and unit_node.is_string:
+        return unit_node.this.upper()
+    return unit_node.sql().upper() if unit_node else ""
+
+
+def _pg_unknown_interval_literal(lit: exp.Expression) -> t.Optional[exp.Interval]:
+    if not isinstance(lit, exp.Literal) or not lit.is_string:
+        return None
+
+    text = lit.this.strip()
+    if not re.fullmatch(r"[+-]?\d+\s*[A-Za-z]+", text):
+        return None
+
+    parts = _parse_compound_interval(text)
+    if len(parts) != 1:
+        return None
+
+    amount, unit = parts[0]
+    return exp.Interval(this=exp.Literal.number(amount), unit=exp.Var(this=unit))
+
+
+def _is_date_interval_arithmetic(node: exp.Expression) -> bool:
+    if _is_date_expression(node):
+        return True
+
+    if isinstance(node, (exp.Add, exp.Sub)):
+        return _is_date_interval_arithmetic(node.this) and (
+            isinstance(node.expression, exp.Interval)
+            or _pg_unknown_interval_literal(node.expression) is not None
+        )
+
+    return False
+
+
+def _coerce_pg_unknown_interval_literals(node: exp.Expression) -> exp.Expression:
+    for op in list(node.find_all(exp.Add, exp.Sub)):
+        interval = _pg_unknown_interval_literal(op.expression)
+        if interval is not None and _is_date_interval_arithmetic(op.this):
+            op.set("expression", interval)
+
+    return node
+
+
+def rewrite_date_part_day_diff_to_datediff(expression: exp.Expression) -> exp.Expression:
+    """
+    Rewrite PG ``date_part('day', end - start)`` interval-style date diffs.
+
+    PostgreSQL can infer ``'12 month'`` as an interval in ``date + '12 month'``
+    and subtracting timestamps produces an interval. Doris does neither in this
+    shape, so emit its native day-difference function for this narrow pattern.
+    """
+    extracts = [expression] if isinstance(expression, exp.Extract) else []
+    extracts.extend(expression.find_all(exp.Extract))
+
+    for extract in extracts:
+        if _extract_unit_name(extract.this) != "DAY":
+            continue
+
+        diff = extract.expression
+        if not isinstance(diff, exp.Sub):
+            continue
+
+        end = _coerce_pg_unknown_interval_literals(diff.this.copy())
+        start = _coerce_pg_unknown_interval_literals(diff.expression.copy())
+        if not (
+            _is_date_interval_arithmetic(end)
+            and _is_date_interval_arithmetic(start)
+        ):
+            continue
+
+        datediff = exp.DateDiff(this=end, expression=start)
+        if extract is expression:
+            expression = datediff
+        else:
+            extract.replace(datediff)
+
+    return expression
+
+
 # --------------------------------------------------------------------------- #
 # Numeric TRUNC function compatibility (PostgreSQL/Oracle → Doris)
 # --------------------------------------------------------------------------- #
@@ -3443,6 +3527,7 @@ def transpile_to_doris(
     expand_like_any_all: bool = True,
     convert_to_char_numeric: bool = True,
     convert_age: bool = True,
+    convert_date_part_day_diff: bool = True,
     convert_numeric_trunc: bool = True,
     preserve_pg_null_order: bool = False,
     nextval_to_default: bool = True,
@@ -3586,6 +3671,11 @@ def transpile_to_doris(
               silently emitting a string with different semantics
             - Unsupported EXTRACT units inside AGE() are left untouched and
               logged at warning level
+        convert_date_part_day_diff: Whether to rewrite PostgreSQL
+            ``date_part('day', end_date - start_date)`` interval-style date
+            differences to Doris ``DATEDIFF(end_date, start_date)`` (default True).
+            This also handles PG's implicit interval strings in the end/start
+            date expression, e.g. ``date_trunc(...) + '12 month'``.
         convert_numeric_trunc: Whether to rewrite numeric ``TRUNC(...)`` calls
             to Doris' ``TRUNCATE(...)`` (default True). ``DATE_TRUNC`` is
             handled separately and is not affected.
@@ -3752,6 +3842,11 @@ def transpile_to_doris(
             if convert_age:
                 normalized = convert_age_in_extract(normalized)
 
+            # PG's date_part('day', timestamp - timestamp) extracts from an
+            # interval; Doris needs an explicit day-difference function.
+            if convert_date_part_day_diff:
+                normalized = rewrite_date_part_day_diff_to_datediff(normalized)
+
             # Doris uses TRUNCATE(...) for numeric truncation; TRUNC(...) is
             # not registered. DATE_TRUNC is a separate expression type.
             if convert_numeric_trunc:
@@ -3897,6 +3992,7 @@ __all__ = [
     "expand_like_any_all_array",
     "rewrite_to_char_numeric",
     "convert_age_in_extract",
+    "rewrite_date_part_day_diff_to_datediff",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_delete_trailing_force",
