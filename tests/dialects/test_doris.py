@@ -93,6 +93,14 @@ class TestDoris(Validator):
     def test_time(self):
         self.validate_identity("TIMESTAMP('2022-01-01')")
 
+    def test_datetimev2(self):
+        self.validate_identity("SELECT CAST(col AS DATETIMEV2) FROM t")
+        self.validate_identity("SELECT CAST(col AS DATETIMEV2(3)) FROM t")
+        self.validate_identity("CREATE TABLE t (dt DATETIMEV2)")
+        self.validate_identity("CREATE TABLE t (dt DATETIMEV2(3))")
+        self.validate_identity("SELECT CAST(col AS DATETIME) FROM t")
+        self.validate_identity("CREATE TABLE t (dt DATETIME(3))")
+
     def test_regex(self):
         self.validate_all(
             "SELECT REGEXP_LIKE(abc, '%foo%')",
