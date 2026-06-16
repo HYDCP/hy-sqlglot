@@ -45,6 +45,56 @@ class Doris(MySQL):
         FUNCTION_PARSERS = MySQL.Parser.FUNCTION_PARSERS.copy()
         FUNCTION_PARSERS.pop("GROUP_CONCAT")
 
+        PROPERTY_PARSERS = {
+            **MySQL.Parser.PROPERTY_PARSERS,
+            "PARTITION BY": lambda self: self._parse_partition_by_opt_range(),
+            "PROPERTIES": lambda self: self._parse_wrapped_properties(),
+        }
+
+        def _parse_partition_range_values(self) -> exp.PartitionRangeValues:
+            self._match_text_seq("PARTITION")
+            name = self._parse_id_var()
+            self._match_text_seq("VALUES")
+
+            if self._match(TokenType.L_BRACKET):
+                start_bound = "["
+            elif self._match(TokenType.L_PAREN):
+                start_bound = "("
+            else:
+                self.raise_error("Expecting [ or (")
+
+            from_expressions = self._parse_wrapped_csv(self._parse_bitwise)
+            self._match(TokenType.COMMA)
+            to_expressions = self._parse_wrapped_csv(self._parse_bitwise)
+
+            if self._match(TokenType.R_BRACKET):
+                end_bound = "]"
+            elif self._match(TokenType.R_PAREN):
+                end_bound = ")"
+            else:
+                self.raise_error("Expecting ] or )")
+
+            return self.expression(
+                exp.PartitionRangeValues,
+                this=name,
+                from_expressions=from_expressions,
+                to_expressions=to_expressions,
+                start_bound=start_bound,
+                end_bound=end_bound,
+            )
+
+        def _parse_partition_by_opt_range(
+            self,
+        ) -> exp.PartitionedByProperty | exp.PartitionByRangeProperty:
+            if self._match_text_seq("RANGE"):
+                return self.expression(
+                    exp.PartitionByRangeProperty,
+                    partition_expressions=self._parse_wrapped_id_vars(),
+                    create_expressions=self._parse_wrapped_csv(self._parse_partition_range_values),
+                )
+
+            return super()._parse_partitioned_by()
+
         def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
             drop = super()._parse_drop(exists=exists)
 
@@ -63,6 +113,7 @@ class Doris(MySQL):
     class Generator(MySQL.Generator):
         LAST_DAY_SUPPORTS_DATE_PART = False
         VARCHAR_REQUIRES_SIZE = False
+        WITH_PROPERTIES_PREFIX = "PROPERTIES"
 
         TYPE_MAPPING = {
             **MySQL.Generator.TYPE_MAPPING,
@@ -74,6 +125,21 @@ class Doris(MySQL):
 
         CAST_MAPPING = {}
         TIMESTAMP_FUNC_TYPES = set()
+
+        PROPERTIES_LOCATION = {
+            **MySQL.Generator.PROPERTIES_LOCATION,
+            exp.PartitionByRangeProperty: exp.Properties.Location.POST_SCHEMA,
+        }
+
+        def partitionrangevalues_sql(self, expression: exp.PartitionRangeValues) -> str:
+            name = self.sql(expression, "this")
+            start = expression.args["start_bound"]
+            end = expression.args["end_bound"]
+            from_expressions = self.expressions(expression, key="from_expressions")
+            to_expressions = self.expressions(expression, key="to_expressions")
+            from_sql = f"{start}{self.wrap(from_expressions)}"
+            to_sql = f"{self.wrap(to_expressions)}{end}"
+            return f"PARTITION {name} VALUES {from_sql}, {to_sql}"
 
         def drop_sql(self, expression: exp.Drop) -> str:
             sql = super().drop_sql(expression)

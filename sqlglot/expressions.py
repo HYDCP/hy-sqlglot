@@ -2900,6 +2900,16 @@ class PartitionByRangeProperty(Property):
     arg_types = {"partition_expressions": True, "create_expressions": True}
 
 
+class PartitionRangeValues(Expression):
+    arg_types = {
+        "this": True,
+        "from_expressions": True,
+        "to_expressions": True,
+        "start_bound": True,
+        "end_bound": True,
+    }
+
+
 # https://docs.starrocks.io/docs/table_design/data_distribution/#range-partitioning
 class PartitionByRangePropertyDynamic(Expression):
     arg_types = {"this": False, "start": True, "end": True, "every": True}

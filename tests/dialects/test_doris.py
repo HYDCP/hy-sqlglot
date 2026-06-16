@@ -109,6 +109,20 @@ class TestDoris(Validator):
             "DROP TABLE IF EXISTS `schema`.`table` FORCE",
         )
 
+    def test_partition_by_range_values(self):
+        self.validate_identity(
+            "CREATE TABLE t (dt DATE) ENGINE=OLAP DUPLICATE KEY (dt) PARTITION BY RANGE (dt) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01'))) DISTRIBUTED BY HASH (dt) BUCKETS 1"
+        )
+        self.validate_identity(
+            "CREATE TABLE t (dt DATE) ENGINE=OLAP DUPLICATE KEY (dt) PARTITION BY RANGE (dt) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01'))) DISTRIBUTED BY HASH (dt) BUCKETS 1 PROPERTIES (replication_num='1')"
+        )
+        self.validate_identity(
+            "CREATE TABLE t (dt DATE) PARTITION BY RANGE (dt) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01')), PARTITION p2 VALUES [('2024-02-01'), ('2024-03-01')))"
+        )
+        self.validate_identity(
+            "CREATE TABLE t (dt DATE, city STRING) PARTITION BY RANGE (dt, city) (PARTITION p1 VALUES [('2024-01-01', 'beijing'), ('2024-02-01', 'shanghai')))"
+        )
+
     def test_regex(self):
         self.validate_all(
             "SELECT REGEXP_LIKE(abc, '%foo%')",
