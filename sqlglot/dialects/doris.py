@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import typing as t
+
 from sqlglot import exp
 from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
@@ -83,6 +85,16 @@ class Doris(MySQL):
                 end_bound=end_bound,
             )
 
+        def _parse_partition_range_values_list(self) -> t.List[exp.PartitionRangeValues]:
+            self._match_l_paren()
+
+            if self._match(TokenType.R_PAREN):
+                return []
+
+            partition_values = self._parse_csv(self._parse_partition_range_values)
+            self._match_r_paren()
+            return partition_values
+
         def _parse_partition_by_opt_range(
             self,
         ) -> exp.PartitionedByProperty | exp.PartitionByRangeProperty:
@@ -90,7 +102,7 @@ class Doris(MySQL):
                 return self.expression(
                     exp.PartitionByRangeProperty,
                     partition_expressions=self._parse_wrapped_id_vars(),
-                    create_expressions=self._parse_wrapped_csv(self._parse_partition_range_values),
+                    create_expressions=self._parse_partition_range_values_list(),
                 )
 
             return super()._parse_partitioned_by()

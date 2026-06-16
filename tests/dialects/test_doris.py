@@ -116,6 +116,9 @@ class TestDoris(Validator):
 
     def test_partition_by_range_values(self):
         self.validate_identity(
+            "CREATE TABLE t (dt DATE) ENGINE=OLAP DUPLICATE KEY (dt) PARTITION BY RANGE (dt) () DISTRIBUTED BY HASH (dt) BUCKETS 1"
+        )
+        self.validate_identity(
             "CREATE TABLE t (dt DATE) ENGINE=OLAP DUPLICATE KEY (dt) PARTITION BY RANGE (dt) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01'))) DISTRIBUTED BY HASH (dt) BUCKETS 1"
         )
         self.validate_identity(

@@ -2897,7 +2897,7 @@ class PartitionedByProperty(Property):
 
 # https://docs.starrocks.io/docs/sql-reference/sql-statements/table_bucket_part_index/CREATE_TABLE/
 class PartitionByRangeProperty(Property):
-    arg_types = {"partition_expressions": True, "create_expressions": True}
+    arg_types = {"partition_expressions": True, "create_expressions": False}
 
 
 class PartitionRangeValues(Expression):
