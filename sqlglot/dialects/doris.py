@@ -9,6 +9,7 @@ from sqlglot.dialects.dialect import (
     unit_to_str,
 )
 from sqlglot.dialects.mysql import MySQL
+from sqlglot.tokens import TokenType
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -24,6 +25,12 @@ class Doris(MySQL):
     DATE_FORMAT = "'yyyy-MM-dd'"
     DATEINT_FORMAT = "'yyyyMMdd'"
     TIME_FORMAT = "'yyyy-MM-dd HH:mm:ss'"
+
+    class Tokenizer(MySQL.Tokenizer):
+        KEYWORDS = {
+            **MySQL.Tokenizer.KEYWORDS,
+            "DATETIMEV2": TokenType.DATETIME2,
+        }
 
     class Parser(MySQL.Parser):
         FUNCTIONS = {
@@ -44,6 +51,7 @@ class Doris(MySQL):
 
         TYPE_MAPPING = {
             **MySQL.Generator.TYPE_MAPPING,
+            exp.DataType.Type.DATETIME2: "DATETIMEV2",
             exp.DataType.Type.TEXT: "STRING",
             exp.DataType.Type.TIMESTAMP: "DATETIME",
             exp.DataType.Type.TIMESTAMPTZ: "DATETIME",
