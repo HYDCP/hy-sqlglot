@@ -126,10 +126,6 @@ class DorisTranspileGenerator(Doris.Generator):
 
         return super().datatype_sql(expression)
 
-    def drop_sql(self, expression: exp.Drop) -> str:
-        sql = super().drop_sql(expression)
-        return f"{sql} FORCE" if expression.args.get("force") else sql
-
     # ------------------------------------------------------------------ #
     # ADB(PostgreSQL) -> Doris specific: preserve "-- ... /*xxx*/"
     # ------------------------------------------------------------------ #

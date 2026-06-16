@@ -45,6 +45,21 @@ class Doris(MySQL):
         FUNCTION_PARSERS = MySQL.Parser.FUNCTION_PARSERS.copy()
         FUNCTION_PARSERS.pop("GROUP_CONCAT")
 
+        def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
+            drop = super()._parse_drop(exists=exists)
+
+            if (
+                isinstance(drop, exp.Drop)
+                and drop.kind == "TABLE"
+                and not drop.args.get("cascade")
+                and not drop.args.get("constraints")
+                and not drop.args.get("purge")
+                and self._match_text_seq("FORCE")
+            ):
+                drop.set("force", True)
+
+            return drop
+
     class Generator(MySQL.Generator):
         LAST_DAY_SUPPORTS_DATE_PART = False
         VARCHAR_REQUIRES_SIZE = False
@@ -59,6 +74,10 @@ class Doris(MySQL):
 
         CAST_MAPPING = {}
         TIMESTAMP_FUNC_TYPES = set()
+
+        def drop_sql(self, expression: exp.Drop) -> str:
+            sql = super().drop_sql(expression)
+            return f"{sql} FORCE" if expression.args.get("force") else sql
 
         TRANSFORMS = {
             **MySQL.Generator.TRANSFORMS,
