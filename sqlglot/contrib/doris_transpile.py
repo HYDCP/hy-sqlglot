@@ -126,6 +126,10 @@ class DorisTranspileGenerator(Doris.Generator):
 
         return super().datatype_sql(expression)
 
+    def drop_sql(self, expression: exp.Drop) -> str:
+        sql = super().drop_sql(expression)
+        return f"{sql} FORCE" if expression.args.get("force") else sql
+
     # ------------------------------------------------------------------ #
     # ADB(PostgreSQL) -> Doris specific: preserve "-- ... /*xxx*/"
     # ------------------------------------------------------------------ #
@@ -3478,6 +3482,21 @@ class PostgresDoris(Postgres):
             # only accepts the value. Keep STR_TO_DATE(...) on its own path.
             "TO_DATE": exp.TsOrDsToDate.from_arg_list,
         }
+
+        def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
+            drop = super()._parse_drop(exists=exists)
+
+            if (
+                isinstance(drop, exp.Drop)
+                and drop.kind == "TABLE"
+                and not drop.args.get("cascade")
+                and not drop.args.get("constraints")
+                and not drop.args.get("purge")
+                and self._match_text_seq("FORCE")
+            ):
+                drop.set("force", True)
+
+            return drop
 
     def parse(self, sql: str, **opts) -> t.List[t.Optional[exp.Expression]]:
         sql = preprocess_doris_date_trunc_order(sql)

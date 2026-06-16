@@ -79,6 +79,30 @@ def test_drop_table_if_exists_transform():
     )
 
 
+def test_drop_table_force_is_preserved_for_doris():
+    """Doris accepts trailing FORCE on single-table DROP TABLE statements."""
+    assert (
+        pg_to_doris("DROP TABLE public.T1 FORCE")[0]
+        == "DROP TABLE IF EXISTS public.t1 FORCE"
+    )
+    assert (
+        pg_to_doris("DROP TABLE IF EXISTS public.T1 FORCE")[0]
+        == "DROP TABLE IF EXISTS public.t1 FORCE"
+    )
+    assert (
+        pg_to_doris("DROP TABLE public.T1 FORCE;")[0]
+        == "DROP TABLE IF EXISTS public.t1 FORCE"
+    )
+    assert (
+        transpile_to_doris(
+            "DROP TABLE public.T1 FORCE",
+            read="postgres",
+            auto_add_drop_table_if_exists=False,
+        )[0]
+        == "DROP TABLE public.t1 FORCE"
+    )
+
+
 def test_nextval_rewrite_insert_union_all():
     """NEXTVAL is rewritten in each SELECT arm of INSERT ... UNION ALL."""
     sql = """
