@@ -109,6 +109,11 @@ class TestDoris(Validator):
             "DROP TABLE IF EXISTS `schema`.`table` FORCE",
         )
 
+    def test_auto_increment_seed(self):
+        self.validate_identity(
+            "CREATE TABLE t (id BIGINT NOT NULL AUTO_INCREMENT(1), `name` STRING)"
+        )
+
     def test_partition_by_range_values(self):
         self.validate_identity(
             "CREATE TABLE t (dt DATE) ENGINE=OLAP DUPLICATE KEY (dt) PARTITION BY RANGE (dt) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01'))) DISTRIBUTED BY HASH (dt) BUCKETS 1"

@@ -1808,7 +1808,7 @@ class ColumnConstraintKind(Expression):
 
 
 class AutoIncrementColumnConstraint(ColumnConstraintKind):
-    pass
+    arg_types = {"this": False}
 
 
 class PeriodForSystemTimeConstraint(ColumnConstraintKind):

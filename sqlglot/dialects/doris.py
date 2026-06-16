@@ -95,6 +95,14 @@ class Doris(MySQL):
 
             return super()._parse_partitioned_by()
 
+        def _parse_auto_increment(self) -> exp.AutoIncrementColumnConstraint:
+            seed = None
+
+            if self._match(TokenType.L_PAREN, advance=False):
+                seed = self._parse_wrapped(self._parse_bitwise)
+
+            return self.expression(exp.AutoIncrementColumnConstraint, this=seed)
+
         def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
             drop = super()._parse_drop(exists=exists)
 
@@ -140,6 +148,13 @@ class Doris(MySQL):
             from_sql = f"{start}{self.wrap(from_expressions)}"
             to_sql = f"{self.wrap(to_expressions)}{end}"
             return f"PARTITION {name} VALUES {from_sql}, {to_sql}"
+
+        def autoincrementcolumnconstraint_sql(
+            self, expression: exp.AutoIncrementColumnConstraint
+        ) -> str:
+            seed = self.sql(expression, "this")
+            sql = self.token_sql(TokenType.AUTO_INCREMENT)
+            return f"{sql}({seed})" if seed else sql
 
         def drop_sql(self, expression: exp.Drop) -> str:
             sql = super().drop_sql(expression)
