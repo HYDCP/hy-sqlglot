@@ -109,6 +109,12 @@ class TestDoris(Validator):
             "DROP TABLE IF EXISTS `schema`.`table` FORCE",
         )
 
+    def test_truncate_partition(self):
+        self.validate_identity(
+            "TRUNCATE TABLE cdm.A_Resv_Cust_Loan_Dtl_D PARTITION p20260601"
+        )
+        self.validate_identity("TRUNCATE TABLE t PARTITION(p20260601)")
+
     def test_auto_increment_seed(self):
         self.validate_identity(
             "CREATE TABLE t (id BIGINT NOT NULL AUTO_INCREMENT(1), `name` STRING)"

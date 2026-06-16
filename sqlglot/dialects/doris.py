@@ -115,6 +115,67 @@ class Doris(MySQL):
 
             return self.expression(exp.AutoIncrementColumnConstraint, this=seed)
 
+        def _parse_truncate_partition(self) -> t.Optional[exp.Partition]:
+            if not self._match(TokenType.PARTITION):
+                return None
+
+            if self._match(TokenType.L_PAREN, advance=False):
+                return self.expression(
+                    exp.Partition,
+                    expressions=self._parse_wrapped_csv(self._parse_assignment),
+                )
+
+            return self.expression(
+                exp.Partition,
+                expressions=self._parse_csv(self._parse_id_var),
+                unwrapped=True,
+            )
+
+        def _parse_truncate_table(self) -> t.Optional[exp.TruncateTable] | exp.Expression:
+            start = self._prev
+
+            if self._match(TokenType.L_PAREN):
+                self._retreat(self._index - 2)
+                return self._parse_function()
+
+            is_database = self._match(TokenType.DATABASE)
+            self._match(TokenType.TABLE)
+            exists = self._parse_exists(not_=False)
+
+            expressions = self._parse_csv(
+                lambda: self._parse_table_parts(schema=True, is_db_reference=is_database)
+            )
+
+            cluster = self._parse_on_property() if self._match(TokenType.ON) else None
+
+            if self._match_text_seq("RESTART", "IDENTITY"):
+                identity = "RESTART"
+            elif self._match_text_seq("CONTINUE", "IDENTITY"):
+                identity = "CONTINUE"
+            else:
+                identity = None
+
+            if self._match_text_seq("CASCADE") or self._match_text_seq("RESTRICT"):
+                option = self._prev.text
+            else:
+                option = None
+
+            partition = self._parse_truncate_partition()
+
+            if self._curr:
+                return self._parse_as_command(start)
+
+            return self.expression(
+                exp.TruncateTable,
+                expressions=expressions,
+                is_database=is_database,
+                exists=exists,
+                cluster=cluster,
+                identity=identity,
+                option=option,
+                partition=partition,
+            )
+
         def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
             drop = super()._parse_drop(exists=exists)
 
@@ -160,6 +221,15 @@ class Doris(MySQL):
             from_sql = f"{start}{self.wrap(from_expressions)}"
             to_sql = f"{self.wrap(to_expressions)}{end}"
             return f"PARTITION {name} VALUES {from_sql}, {to_sql}"
+
+        def partition_sql(self, expression: exp.Partition) -> str:
+            if expression.args.get("unwrapped"):
+                partition_keyword = (
+                    "SUBPARTITION" if expression.args.get("subpartition") else "PARTITION"
+                )
+                return f"{partition_keyword} {self.expressions(expression, flat=True)}"
+
+            return super().partition_sql(expression)
 
         def autoincrementcolumnconstraint_sql(
             self, expression: exp.AutoIncrementColumnConstraint
