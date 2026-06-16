@@ -103,6 +103,18 @@ def test_drop_table_force_is_preserved_for_doris():
     )
 
 
+def test_full_join_is_preserved_for_doris():
+    """Doris supports FULL JOIN natively and should not use MySQL emulation."""
+    assert (
+        pg_to_doris("SELECT * FROM A FULL JOIN B ON A.id = B.id")[0]
+        == "SELECT * FROM a FULL JOIN b ON a.id = b.id"
+    )
+    assert (
+        pg_to_doris("SELECT * FROM A FULL OUTER JOIN B ON A.id = B.id")[0]
+        == "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id"
+    )
+
+
 def test_nextval_rewrite_insert_union_all():
     """NEXTVAL is rewritten in each SELECT arm of INSERT ... UNION ALL."""
     sql = """

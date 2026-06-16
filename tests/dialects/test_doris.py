@@ -90,6 +90,20 @@ class TestDoris(Validator):
         self.validate_identity("SELECT CAST(`a`.`b` AS INT) FROM foo")
         self.validate_identity("SELECT APPROX_COUNT_DISTINCT(a) FROM x")
 
+    def test_full_join(self):
+        self.validate_all(
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id",
+            write={
+                "doris": "SELECT * FROM a FULL JOIN b ON a.id = b.id",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+            write={
+                "doris": "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+            },
+        )
+
     def test_time(self):
         self.validate_identity("TIMESTAMP('2022-01-01')")
 

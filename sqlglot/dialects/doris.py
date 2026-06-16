@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlglot import exp
+from sqlglot import exp, transforms
 from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
     build_timestamp_trunc,
@@ -71,6 +71,14 @@ class Doris(MySQL):
             exp.Map: rename_func("ARRAY_MAP"),
             exp.RegexpLike: rename_func("REGEXP"),
             exp.RegexpSplit: rename_func("SPLIT_BY_STRING"),
+            exp.Select: transforms.preprocess(
+                [
+                    transforms.eliminate_distinct_on,
+                    transforms.eliminate_semi_and_anti_joins,
+                    transforms.eliminate_qualify,
+                    transforms.unnest_generate_date_array_using_recursive_cte,
+                ]
+            ),
             exp.Split: rename_func("SPLIT_BY_STRING"),
             exp.StringToArray: rename_func("SPLIT_BY_STRING"),
             exp.StrToUnix: lambda self, e: self.func("UNIX_TIMESTAMP", e.this, self.format_time(e)),
