@@ -101,6 +101,14 @@ class TestDoris(Validator):
         self.validate_identity("SELECT CAST(col AS DATETIME) FROM t")
         self.validate_identity("CREATE TABLE t (dt DATETIME(3))")
 
+    def test_drop_table_force(self):
+        self.validate_identity("DROP TABLE IF EXISTS test_table FORCE")
+        self.validate_identity("DROP TABLE test_table FORCE")
+        self.validate_identity(
+            "DROP TABLE IF EXISTS schema.table FORCE",
+            "DROP TABLE IF EXISTS `schema`.`table` FORCE",
+        )
+
     def test_regex(self):
         self.validate_all(
             "SELECT REGEXP_LIKE(abc, '%foo%')",
