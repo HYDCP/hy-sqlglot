@@ -432,6 +432,22 @@ class Postgres(Dialect):
             )([this, path]),
         }
 
+        def _parse_alter(self) -> exp.Alter | exp.Command:
+            # Greenplum's legacy ADD PARTITION syntax is not PostgreSQL's
+            # declarative partition syntax. Let it round-trip as a command
+            # instead of treating PARTITION as a new column definition, which
+            # can trigger pathological column-constraint error recovery.
+            if self._curr and self._curr.token_type == TokenType.TABLE:
+                remaining = self._tokens[self._index :]
+                if any(
+                    token.text.upper() == "ADD"
+                    and next_token.text.upper() == "PARTITION"
+                    for token, next_token in zip(remaining, remaining[1:])
+                ):
+                    return self._parse_as_command(self._prev)
+
+            return super()._parse_alter()
+
         def _parse_operator(self, this: t.Optional[exp.Expression]) -> t.Optional[exp.Expression]:
             while True:
                 if not self._match(TokenType.L_PAREN):

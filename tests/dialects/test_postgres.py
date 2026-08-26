@@ -7,6 +7,20 @@ class TestPostgres(Validator):
     maxDiff = None
     dialect = "postgres"
 
+    def test_greenplum_add_partition_falls_back_to_command(self):
+        sql = (
+            "ALTER TABLE cdm.m10_disc_info ADD PARTITION IF NOT EXISTS p202608 "
+            "START (DATE_TRUNC('month', TO_DATE('20260826', 'YYYYMMDD'))::DATE) INCLUSIVE "
+            "END ((DATE_TRUNC('month', TO_DATE('20260826', 'YYYYMMDD')) + "
+            "INTERVAL '1 month')::DATE) EXCLUSIVE WITH (APPENDONLY=TRUE, "
+            "COMPRESSTYPE=LZ4, COMPRESSLEVEL=9, ORIENTATION=COLUMN)"
+        )
+
+        expression = self.parse_one(sql)
+
+        self.assertIsInstance(expression, exp.Command)
+        self.assertEqual(expression.sql(dialect="postgres"), sql)
+
     def test_postgres(self):
         self.validate_all(
             "x ? y",
