@@ -5,6 +5,63 @@ from tests.dialects.test_dialect import Validator
 class TestADB(Validator):
     dialect = "adb"
 
+    def test_create_distribution(self):
+        for source, target in (
+            ("CREATE TABLE t (id INT, payload VARCHAR(8)) DISTRIBUTED BY (id, payload)",
+             "CREATE TABLE t (id INT, payload VARCHAR(8)) DISTRIBUTED BY HASH (id, payload)"),
+            ("CREATE TABLE t AS SELECT 1 AS id DISTRIBUTED BY (id)",
+             "CREATE TABLE t DISTRIBUTED BY HASH (id) AS SELECT 1 AS id"),
+            ("CREATE TABLE t AS SELECT id FROM source DISTRIBUTED BY (id)",
+             "CREATE TABLE t DISTRIBUTED BY HASH (id) AS SELECT id FROM source"),
+            ("CREATE TABLE t AS SELECT id DISTRIBUTED BY (id)",
+             "CREATE TABLE t DISTRIBUTED BY HASH (id) AS SELECT id"),
+            ("CREATE TABLE t AS SELECT 1 AS id DISTRIBUTED RANDOMLY",
+             "CREATE TABLE t DISTRIBUTED BY RANDOM AS SELECT 1 AS id"),
+            ('CREATE TABLE "T" AS SELECT 1 AS "set" DISTRIBUTED BY ("set")',
+             'CREATE TABLE `T` DISTRIBUTED BY HASH (`set`) AS SELECT 1 AS `set`'),
+        ):
+            with self.subTest(source=source):
+                tree = self.validate_identity(source)
+                distribution = tree.args["properties"].expressions[-1]
+                self.assertIsInstance(distribution, exp.DistributedByProperty)
+                self.assertEqual(tree.sql("doris", unsupported_level=ErrorLevel.RAISE), target)
+                self.assertEqual(parse_one(target, read="doris").sql("adb"), source)
+
+    def test_create_storage_properties_retained(self):
+        source = "CREATE TABLE t WITH (appendonly=TRUE, custom='literal DISTRIBUTED BY (x)', orientation=column) AS SELECT 1 AS id DISTRIBUTED BY (id)"
+        tree = self.validate_identity(source)
+        properties = tree.args["properties"].expressions
+        self.assertEqual(len(properties), 4)
+        self.assertEqual(properties[1].args["value"].this, "literal DISTRIBUTED BY (x)")
+        self.assertEqual(tree.sql("adb"), source)
+        self.validate_identity('SELECT id AS "DISTRIBUTED" FROM source AS "DISTRIBUTED"')
+
+    def test_create_explicit_population_clause_retained(self):
+        for population in ("WITH DATA", "WITH NO DATA"):
+            source = f"CREATE TEMPORARY TABLE t AS SELECT 1 AS id {population} DISTRIBUTED BY (id)"
+            tree = self.parse_one(source)
+            self.assertIsInstance(tree, exp.Create)
+            self.assertIn(population, tree.sql("adb"))
+            self.assertEqual(tree.args["properties"].expressions[-1].expressions[0].name, "id")
+
+    def test_invalid_create_distribution_is_not_partial_ast(self):
+        for source in ("CREATE TABLE t (id INT) DISTRIBUTED BY ()",
+                       "CREATE TABLE t (id INT) DISTRIBUTED BY (id+1)",
+                       "CREATE TABLE t (id INT) DISTRIBUTED BY (id) trailing"):
+            with self.subTest(source=source):
+                try:
+                    tree = parse_one(source, read="adb", error_level=ErrorLevel.IMMEDIATE)
+                except ParseError:
+                    continue
+                self.assertIsInstance(tree, exp.Command)
+
+    def test_doris_table_properties_round_trip(self):
+        source = "CREATE TABLE t (payload VARCHAR(32) NULL, id INT NOT NULL) DISTRIBUTED BY HASH (id) PROPERTIES ('enable_duplicate_without_keys_by_default'='true')"
+        tree = parse_one(source, read="doris", error_level=ErrorLevel.IMMEDIATE)
+        self.assertIsInstance(tree, exp.Create)
+        self.assertEqual(tree.sql("doris"), source)
+        self.assertEqual(tree.this.expressions[0].name, "payload")
+
     def test_range_partition(self):
         source = "ALTER TABLE raw.fact ADD PARTITION d20261014 START ('2026-10-14') INCLUSIVE END ('2026-10-15') EXCLUSIVE"
         target = "ALTER TABLE raw.fact ADD PARTITION d20261014 VALUES [('2026-10-14'), ('2026-10-15'))"

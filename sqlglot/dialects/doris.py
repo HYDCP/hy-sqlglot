@@ -8,6 +8,7 @@ from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
     build_timestamp_trunc,
     rename_func,
+    property_sql,
     time_format,
     unit_to_str,
 )
@@ -30,6 +31,11 @@ class Doris(MySQL):
     TIME_FORMAT = "'yyyy-MM-dd HH:mm:ss'"
 
     class Parser(MySQL.Parser):
+        PROPERTY_PARSERS = {
+            **MySQL.Parser.PROPERTY_PARSERS,
+            "PROPERTIES": lambda self: self._parse_wrapped_properties(),
+        }
+
         FUNCTIONS = {
             **MySQL.Parser.FUNCTIONS,
             "COLLECT_SET": exp.ArrayUniqueAgg.from_arg_list,
@@ -95,6 +101,8 @@ class Doris(MySQL):
             )
 
     class Generator(MySQL.Generator):
+        WITH_PROPERTIES_PREFIX = "PROPERTIES"
+
         def addpartition_sql(self, expression):
             if not isinstance(expression.this, exp.Identifier):
                 self.unsupported(
@@ -211,6 +219,7 @@ class Doris(MySQL):
 
         TRANSFORMS = {
             **MySQL.Generator.TRANSFORMS,
+            exp.Property: property_sql,
             exp.AddMonths: rename_func("MONTHS_ADD"),
             exp.ApproxDistinct: approx_count_distinct_sql,
             exp.ArgMax: rename_func("MAX_BY"),

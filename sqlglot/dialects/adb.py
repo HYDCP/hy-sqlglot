@@ -6,9 +6,39 @@ from sqlglot.tokens import TokenType
 
 
 class ADB(Postgres):
-    """AnalyticDB for PostgreSQL's named range-partition ALTER syntax."""
+    """AnalyticDB for PostgreSQL's distribution and named partition syntax."""
 
     class Parser(Postgres.Parser):
+        def _distribution_clause(self):
+            if self._match(TokenType.IDENTIFIER, advance=False):
+                return False
+            return self._match_text_seq("DISTRIBUTED", "BY", advance=False) or self._match_text_seq(
+                "DISTRIBUTED", "RANDOMLY", advance=False
+            )
+
+        def _parse_alias(self, this, explicit=False):
+            if self._distribution_clause():
+                return this
+            return super()._parse_alias(this, explicit=explicit)
+
+        def _parse_table_alias(self, alias_tokens=None):
+            if self._distribution_clause():
+                return None
+            return super()._parse_table_alias(alias_tokens=alias_tokens)
+
+        def _parse_distributed_property(self):
+            if self._match_text_seq("BY", "(", advance=False):
+                self._advance()
+                columns = self._parse_wrapped_csv(self._parse_id_var)
+                if not columns:
+                    self.raise_error("Expecting distribution columns")
+                return self.expression(
+                    exp.DistributedByProperty, expressions=columns, kind="HASH"
+                )
+            if self._match_text_seq("RANDOMLY"):
+                return self.expression(exp.DistributedByProperty, kind="RANDOM")
+            return super()._parse_distributed_property()
+
         def _parse_alter_table_add(self):
             if not self._match(TokenType.PARTITION, advance=False):
                 return super()._parse_alter_table_add()
@@ -81,6 +111,18 @@ class ADB(Postgres):
             )
 
     class Generator(Postgres.Generator):
+        PROPERTIES_LOCATION = {
+            **Postgres.Generator.PROPERTIES_LOCATION,
+            exp.DistributedByProperty: exp.Properties.Location.POST_EXPRESSION,
+        }
+
+        def distributedbyproperty_sql(self, expression):
+            if expression.args.get("buckets") or expression.args.get("order"):
+                self.unsupported("ADB distribution does not support BUCKETS or ORDER BY")
+            if expression.args.get("kind") == "RANDOM":
+                return "DISTRIBUTED RANDOMLY"
+            return f"DISTRIBUTED BY ({self.expressions(expression, flat=True)})"
+
         def partitionboundspec_sql(self, expression):
             if expression.args.get("from_inclusive") is None:
                 return super().partitionboundspec_sql(expression)
