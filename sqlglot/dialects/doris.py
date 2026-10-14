@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import date
+import re
+
 from sqlglot import exp, transforms
 from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
@@ -9,6 +12,7 @@ from sqlglot.dialects.dialect import (
     unit_to_str,
 )
 from sqlglot.dialects.mysql import MySQL
+from sqlglot.tokens import TokenType
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -38,7 +42,160 @@ class Doris(MySQL):
         FUNCTION_PARSERS = MySQL.Parser.FUNCTION_PARSERS.copy()
         FUNCTION_PARSERS.pop("GROUP_CONCAT")
 
+        def _parse_alter_table_add(self):
+            if not self._match(TokenType.PARTITION, advance=False):
+                return super()._parse_alter_table_add()
+            return self._parse_csv(self._parse_add_range_partition)
+
+        def _parse_add_range_partition(self):
+            self._match_text_seq("ADD")
+            if not self._match(TokenType.PARTITION):
+                self.raise_error("Expecting PARTITION")
+            exists = self._parse_exists(not_=True)
+            name = self._parse_id_var(any_token=False)
+            if not self._match(TokenType.VALUES) or not self._match(
+                TokenType.L_BRACKET
+            ):
+                self.raise_error("Expecting VALUES [")
+            lower = self._parse_wrapped_csv(self._parse_assignment)
+            if not self._match(TokenType.COMMA):
+                self.raise_error("Expecting comma between partition bounds")
+            upper = self._parse_wrapped_csv(self._parse_assignment)
+            if not self._match(TokenType.R_PAREN):
+                self.raise_error("Expecting exclusive upper bound )")
+            return self.expression(
+                exp.AddPartition,
+                this=name,
+                exists=exists,
+                expression=self.expression(
+                    exp.PartitionBoundSpec,
+                    from_expressions=lower,
+                    to_expressions=upper,
+                    from_inclusive=True,
+                    to_inclusive=False,
+                ),
+            )
+
+        def _parse_alter_table_drop(self):
+            if not self._match(TokenType.PARTITION, advance=False):
+                return super()._parse_alter_table_drop()
+            return self._parse_csv(self._parse_named_drop_partition)
+
+        def _parse_named_drop_partition(self):
+            self._match(TokenType.DROP)
+            if not self._match(TokenType.PARTITION):
+                self.raise_error("Expecting PARTITION")
+            exists = self._parse_exists()
+            name = self._parse_id_var(any_token=False)
+            if name is None:
+                self.raise_error("Expecting partition name")
+            partition = self.expression(exp.Partition, expressions=[name])
+            return self.expression(
+                exp.DropPartition, expressions=[partition], exists=exists
+            )
+
     class Generator(MySQL.Generator):
+        def addpartition_sql(self, expression):
+            if not isinstance(expression.this, exp.Identifier):
+                self.unsupported(
+                    "Doris ADD PARTITION requires an explicit partition name"
+                )
+            if expression.args.get("properties"):
+                self.unsupported(
+                    "Partition storage properties require an explicit Doris mapping"
+                )
+            return super().addpartition_sql(expression)
+
+        def partitionboundspec_sql(self, expression):
+            if (
+                expression.this
+                or expression.expression
+                or expression.args.get("from_inclusive") is False
+                or expression.args.get("to_inclusive")
+            ):
+                self.unsupported(
+                    "Doris range partitions require inclusive lower / exclusive upper bounds"
+                )
+            lower = expression.args.get("from_expressions") or []
+            upper = expression.args.get("to_expressions") or []
+            if not lower or len(lower) != len(upper):
+                self.unsupported(
+                    "Doris range partition bounds must be nonempty tuples of equal length"
+                )
+            lower = self._partition_bound_values(lower)
+            upper = self._partition_bound_values(upper)
+            return f"VALUES [({lower}), ({upper}))"
+
+        def _partition_bound_values(self, expressions):
+            values = []
+            for value in expressions:
+                if (
+                    type(value) is exp.Cast
+                    and isinstance(value.this, exp.Literal)
+                    and value.this.is_string
+                    and isinstance(value.to, exp.DataType)
+                    and value.to.this == exp.DataType.Type.DATE
+                    and not any(
+                        value.args.get(key)
+                        for key in ("format", "safe", "action", "default")
+                    )
+                ):
+                    text = value.this.this
+                    match = re.fullmatch(
+                        r"(?:[0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2})", text
+                    )
+                    digits = text.replace("-", "")
+                    try:
+                        parsed = (
+                            date(int(digits[:4]), int(digits[4:6]), int(digits[6:]))
+                            if match
+                            else None
+                        )
+                    except ValueError:
+                        parsed = None
+                    if parsed is not None:
+                        value = exp.Literal.string(
+                            f"{parsed.year:04d}{parsed.month:02d}{parsed.day:02d}"
+                        )
+                number = value.this if isinstance(value, exp.Neg) else value
+                if (
+                    isinstance(number, exp.Literal)
+                    and number.is_number
+                    and re.fullmatch(r"[0-9]+", number.this)
+                ):
+                    digits = number.this.lstrip("0") or "0"
+                    if isinstance(value, exp.Neg) and digits != "0":
+                        digits = "-" + digits
+                    value = exp.Literal.string(digits)
+                if not (
+                    (isinstance(value, exp.Literal) and value.is_string)
+                    or (isinstance(value, exp.Var) and value.name.upper() == "MAXVALUE")
+                ):
+                    self.unsupported(
+                        "Doris partition bounds require string literals, integers or MAXVALUE"
+                    )
+                values.append(self.sql(value))
+            return ", ".join(values)
+
+        def droppartition_sql(self, expression):
+            clauses = []
+            exists = " IF EXISTS" if expression.args.get("exists") else ""
+            for partition in expression.expressions:
+                if not (
+                    isinstance(partition, exp.Partition)
+                    and not partition.args.get("subpartition")
+                    and len(partition.expressions) == 1
+                    and isinstance(partition.expressions[0], exp.Identifier)
+                ):
+                    self.unsupported(
+                        "Doris DROP PARTITION requires an explicit partition name"
+                    )
+                    continue
+                clauses.append(
+                    f"DROP PARTITION{exists} {self.sql(partition.expressions[0])}"
+                )
+            return ", ".join(clauses)
+
         LAST_DAY_SUPPORTS_DATE_PART = False
         VARCHAR_REQUIRES_SIZE = False
 

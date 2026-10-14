@@ -64,6 +64,7 @@ dialect implementations in order to understand how their various components can 
 import importlib
 
 DIALECTS = [
+    "ADB",
     "Athena",
     "BigQuery",
     "ClickHouse",

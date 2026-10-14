@@ -2918,6 +2918,8 @@ class PartitionBoundSpec(Expression):
         "expression": False,
         "from_expressions": False,
         "to_expressions": False,
+        "from_inclusive": False,
+        "to_inclusive": False,
     }
 
 
@@ -4835,6 +4837,10 @@ class AddConstraint(Expression):
 
 class AttachOption(Expression):
     arg_types = {"this": True, "expression": False}
+
+
+class AddPartition(Expression):
+    arg_types = {"this": False, "expression": True, "exists": False, "properties": False}
 
 
 class DropPartition(Expression):

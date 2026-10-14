@@ -60,6 +60,7 @@ class Dialects(str, Enum):
 
     DIALECT = ""
 
+    ADB = "adb"
     ATHENA = "athena"
     BIGQUERY = "bigquery"
     CLICKHOUSE = "clickhouse"

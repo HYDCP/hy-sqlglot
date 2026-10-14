@@ -1774,6 +1774,8 @@ class Generator(metaclass=_Generator):
             remainder = self.sql(expression, "expression")
             return f"WITH (MODULUS {modulus}, REMAINDER {remainder})"
 
+        if expression.args.get("from_inclusive") is False or expression.args.get("to_inclusive"):
+            self.unsupported("Only inclusive lower / exclusive upper partition bounds are supported")
         from_expressions = self.expressions(expression, key="from_expressions", flat=True)
         to_expressions = self.expressions(expression, key="to_expressions", flat=True)
         return f"FROM ({from_expressions}) TO ({to_expressions})"
@@ -3386,6 +3388,14 @@ class Generator(metaclass=_Generator):
                 skip_first=True,
             )
         return f"ADD {self.expressions(expression, key='actions', flat=True)}"
+
+    def addpartition_sql(self, expression: exp.AddPartition) -> str:
+        exists = " IF NOT EXISTS" if expression.args.get("exists") else ""
+        name = self.sql(expression, "this")
+        name = f" {name}" if name else ""
+        properties = self.sql(expression, "properties")
+        properties = f" {properties}" if properties else ""
+        return f"ADD PARTITION{exists}{name} {self.sql(expression, 'expression')}{properties}"
 
     def droppartition_sql(self, expression: exp.DropPartition) -> str:
         expressions = self.expressions(expression)
