@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -294,6 +296,42 @@ class TestParser(unittest.TestCase):
             parse_one("SELECT A[:")
 
         self.assertEqual(parse_one("as as", error_level=ErrorLevel.IGNORE).sql(), "AS as")
+
+    def test_unrecognized_column_constraint_terminates(self):
+        # A separate process bounds the regression if parsing stops making progress.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sqlglot import exp, parse_one; from sqlglot.errors import ErrorLevel, ParseError\n"
+                "for dialect in (None, 'postgres', 'doris'):\n"
+                " for sql in ('CREATE TABLE t (id INT NOT FOO)', "
+                "'CREATE TABLE t (id INT CONSTRAINT c NOT FOO)', "
+                "'CREATE TABLE t (id INT PERIOD FOO)', "
+                "'CREATE TABLE t (id INT CONSTRAINT c PERIOD FOO)', "
+                "'ALTER TABLE t ADD PARTITION IF NOT EXISTS p'):\n"
+                "  try: expression = parse_one(sql, read=dialect, error_level=ErrorLevel.RAISE)\n"
+                "  except ParseError: pass\n"
+                "  else: assert isinstance(expression, exp.Command), (dialect, sql, expression)\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_valid_column_constraints_after_not_null(self):
+        for dialect in (None, "postgres", "doris"):
+            with self.subTest(dialect=dialect):
+                expression = parse_one(
+                    "CREATE TABLE t (id INT CONSTRAINT c NOT NULL DEFAULT 1)", read=dialect
+                )
+                constraints = expression.this.expressions[0].constraints
+                self.assertEqual(len(constraints), 2)
+                self.assertEqual(constraints[0].this.name, "c")
+                self.assertIsInstance(constraints[0].kind, exp.NotNullColumnConstraint)
+                self.assertIsInstance(constraints[1].kind, exp.DefaultColumnConstraint)
 
     def test_space(self):
         self.assertEqual(

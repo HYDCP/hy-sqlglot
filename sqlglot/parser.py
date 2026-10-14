@@ -5866,10 +5866,15 @@ class Parser(metaclass=_Parser):
         )
 
         if not procedure_option_follows and self._match_texts(self.CONSTRAINT_PARSERS):
+            kind = self.CONSTRAINT_PARSERS[self._prev.text.upper()](self)
+            # A parser can retreat and return None when the constraint doesn't match.
+            # An empty constraint would make _parse_column_def repeat the same token.
+            if kind is None:
+                return None
             return self.expression(
                 exp.ColumnConstraint,
                 this=this,
-                kind=self.CONSTRAINT_PARSERS[self._prev.text.upper()](self),
+                kind=kind,
             )
 
         return this
