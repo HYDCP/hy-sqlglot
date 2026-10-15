@@ -5,6 +5,28 @@ from tests.dialects.test_dialect import Validator
 class TestADB(Validator):
     dialect = "adb"
 
+    def test_to_char_keeps_raw_format_and_strict_arity(self):
+        for mask in ("yyyy-MM-DD", '"YYYY" YYYY', '"%Y" YYYY',
+                     r'"a\\b\"c" YYYY', "纯字面%", "", "FM000000", "0.999"):
+            tree = exp.select(exp.ToChar(this=exp.column("v"), format=exp.Literal.string(mask)))
+            parsed = self.parse_one(tree.sql("adb"))
+            self.assertEqual(parsed, tree)
+            self.assertEqual(self.parse_one(parsed.sql("adb")), tree)
+            self.assertEqual(parsed.find(exp.ToChar).args["format"].this, mask)
+        for args in ("", "v", "v, 'YYYY', 'extra'"):
+            with self.assertRaises(ParseError):
+                parse_one(f"SELECT TO_CHAR({args})", read="adb", error_level=ErrorLevel.IMMEDIATE)
+
+    def test_to_char_does_not_capture_qualified_or_quoted_udf(self):
+        for source in ('SELECT "to_char"(v, \'YYYY\')', "SELECT app.to_char(v, 'YYYY')"):
+            tree = self.parse_one(source)
+            self.assertIsNone(tree.find(exp.ToChar))
+            self.assertIsNotNone(tree.find(exp.Anonymous))
+            self.assertIsNone(self.parse_one(tree.sql("adb")).find(exp.ToChar))
+        for function, node in (("TO_DATE", exp.StrToDate), ("TO_TIMESTAMP", exp.StrToTime)):
+            self.assertIsInstance(self.parse_one(f"{function}('20261015', 'YYYYMMDD')"), node)
+        self.assertIsInstance(parse_one("TO_CHAR(v, 'YYYY')", read="postgres"), exp.TimeToStr)
+
     def test_truncate_partition_structure_and_roundtrip(self):
         for source, target in (
             (

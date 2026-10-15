@@ -9,6 +9,25 @@ class ADB(Postgres):
     """AnalyticDB for PostgreSQL's distribution and named partition syntax."""
 
     class Parser(Postgres.Parser):
+        FUNCTION_PARSERS = {
+            **Postgres.Parser.FUNCTION_PARSERS,
+            "TO_CHAR": lambda self: self._parse_to_char(),
+        }
+
+        def _parse_to_char(self):
+            name = self._tokens[self._index - 2]
+            args = self._parse_csv(lambda: self._parse_lambda(alias=False))
+            if name.token_type == TokenType.IDENTIFIER:
+                return self.expression(
+                    exp.Anonymous,
+                    this=exp.Identifier(this=name.text, quoted=True),
+                    expressions=args,
+                )
+            if len(args) != 2:
+                self.raise_error("TO_CHAR requires exactly two arguments")
+                return None
+            return self.expression(exp.ToChar, this=args[0], format=args[1])
+
         ALTER_PARSERS = {
             **Postgres.Parser.ALTER_PARSERS,
             "TRUNCATE": lambda self: self._parse_truncate_partition(),
