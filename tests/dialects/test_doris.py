@@ -5,6 +5,9 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_native_array_constructor_round_trip(self):
+        self.validate_identity("SELECT ARRAY(1, NULL, 3)")
+
     def test_truncate_multiple_named_partitions(self):
         for source in (
             "TRUNCATE TABLE raw.fact PARTITION(p1, p2)",
@@ -124,6 +127,36 @@ class TestDoris(Validator):
 
     def test_time(self):
         self.validate_identity("TIMESTAMP('2022-01-01')")
+
+    def test_datetimev2_type_alias_preserves_precision(self):
+        for precision in (None, 0, 4, 6):
+            suffix = "" if precision is None else f"({precision})"
+            for sql in (
+                f"SELECT CAST(x AS DATETIMEV2{suffix}) FROM t",
+                f"CREATE TABLE t (x DATETIMEV2{suffix})",
+            ):
+                with self.subTest(sql=sql):
+                    canonical = sql.replace("DATETIMEV2", "DATETIME")
+                    tree = self.validate_identity(sql, canonical)
+                    self.assertEqual(tree, parse_one(canonical, read="doris"))
+                    datatype = tree.find(exp.DataType)
+                    self.assertEqual(datatype.this, exp.DataType.Type.DATETIME)
+                    self.assertEqual(
+                        [parameter.this for parameter in datatype.expressions],
+                        [] if precision is None else [exp.Literal.number(precision)],
+                    )
+                    self.assertEqual(parse_one(tree.sql("doris"), read="doris"), tree)
+
+    def test_datetimev2_quoted_identifiers_remain_identifiers(self):
+        for sql in (
+            "SELECT `DATETIMEV2`.`DATETIMEV2` AS `DATETIMEV2` FROM `DATETIMEV2`",
+            "CREATE TABLE `DATETIMEV2` (`DATETIMEV2` INT)",
+        ):
+            with self.subTest(sql=sql):
+                tree = self.validate_identity(sql)
+                for identifier in tree.find_all(exp.Identifier):
+                    self.assertEqual(identifier.this, "DATETIMEV2")
+                    self.assertTrue(identifier.quoted)
 
     def test_date_trunc_preserves_datetime_expression_in_both_signatures(self):
         values = (

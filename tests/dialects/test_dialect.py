@@ -373,8 +373,8 @@ class TestDialect(Validator):
         self.validate_all(
             "CAST('1 DAY' AS INTERVAL)",
             write={
-                "postgres": "CAST('1 DAY' AS INTERVAL)",
-                "redshift": "CAST('1 DAY' AS INTERVAL)",
+                "postgres": "INTERVAL '1 DAY'",
+                "redshift": "INTERVAL '1 DAY'",
             },
         )
         self.validate_all(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import typing as t
 from collections import defaultdict
 
@@ -1632,6 +1633,18 @@ class Parser(metaclass=_Parser):
         Returns:
             The target expression.
         """
+        # A static interval CAST has the same AST as its INTERVAL literal.
+        # Normalize here so both CAST(... AS INTERVAL) and ::INTERVAL agree.
+        if exp_class is exp.Cast:
+            this, to = kwargs.get("this"), kwargs.get("to")
+            if (isinstance(this, exp.Literal) and this.is_string
+                    and isinstance(to, exp.DataType) and to.this == exp.DataType.Type.INTERVAL
+                    and not to.expressions and not any(kwargs.get(k) for k in ("format", "action", "default"))):
+                match = exp.INTERVAL_STRING_RE.fullmatch(this.this)
+                if match and "." not in match[1]:
+                    exp_class = exp.Interval
+                    kwargs = {"this": exp.Literal.string(re.sub(r"\s+", "", match[1])),
+                              "unit": exp.Var(this=match[2].upper())}
         instance = exp_class(**kwargs)
         instance.add_comments(comments) if comments else self._add_comments(instance)
         return self.validate_expression(instance)
@@ -4799,9 +4812,10 @@ class Parser(metaclass=_Parser):
                 unit = None
                 self._retreat(self._index - 1)
 
-            if len(parts) == 1:
-                this = exp.Literal.string(parts[0][0])
-                unit = self.expression(exp.Var, this=parts[0][1].upper())
+            match = exp.INTERVAL_STRING_RE.fullmatch(this.name)
+            if match:
+                this = exp.Literal.string(re.sub(r"\s+", "", match[1]))
+                unit = self.expression(exp.Var, this=match[2].upper())
         if self.INTERVAL_SPANS and self._match_text_seq("TO"):
             unit = self.expression(
                 exp.IntervalSpan, this=unit, expression=self._parse_var(any_token=True, upper=True)

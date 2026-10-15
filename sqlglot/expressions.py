@@ -5164,6 +5164,7 @@ class TimeUnit(Expression):
         "D": "DAY",
         "H": "HOUR",
         "M": "MINUTE",
+        "MIN": "MINUTE",
         "MS": "MILLISECOND",
         "NS": "NANOSECOND",
         "Q": "QUARTER",
@@ -7806,7 +7807,7 @@ def parse_identifier(name: str | Identifier, dialect: DialectType = None) -> Ide
     return expression
 
 
-INTERVAL_STRING_RE = re.compile(r"\s*([0-9]+)\s*([a-zA-Z]+)\s*")
+INTERVAL_STRING_RE = re.compile(r"\s*([+-]?\s*[0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)\s*")
 
 
 def to_interval(interval: str | Literal) -> Interval:

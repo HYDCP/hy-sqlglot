@@ -797,6 +797,21 @@ class TestExpressions(unittest.TestCase):
             self.assertIsInstance(interval.unit, exp.Var)
             self.assertEqual(interval.unit.name, unnabreviated_unit)
 
+    def test_interval_signs_static_casts_and_full_tokens(self):
+        for source in ("INTERVAL '- 1d'", "CAST('- 1d' AS INTERVAL)", "'- 1d'::INTERVAL"):
+            interval = parse_one(source, read="postgres")
+            self.assertIsInstance(interval, exp.Interval)
+            self.assertEqual(interval.this.this, "-1")
+            self.assertEqual(interval.unit.name, "DAY")
+        for value, unit in (("30 MIN", "MINUTE"), ("1 y", "YEAR"), ("+ 1year", "YEAR")):
+            interval = parse_one(f"INTERVAL '{value}'", read="postgres")
+            self.assertEqual(interval.unit.name, unit)
+        interval = parse_one("INTERVAL '1 MINx'", read="postgres")
+        self.assertEqual(interval.unit.name, "MINX")
+        self.assertIsInstance(parse_one("p::INTERVAL", read="postgres"), exp.Cast)
+        for value in ("1.5 months", "0.5 day", "1.5 year"):
+            self.assertIsInstance(parse_one(f"'{value}'::INTERVAL", read="postgres"), exp.Cast)
+
     def test_identifier(self):
         self.assertTrue(exp.to_identifier('"x"').quoted)
         self.assertFalse(exp.to_identifier("x").quoted)

@@ -44,6 +44,12 @@ class Doris(MySQL):
     DATEINT_FORMAT = "'yyyyMMdd'"
     TIME_FORMAT = "'yyyy-MM-dd HH:mm:ss'"
 
+    class Tokenizer(MySQL.Tokenizer):
+        KEYWORDS = {
+            **MySQL.Tokenizer.KEYWORDS,
+            "DATETIMEV2": TokenType.DATETIME,
+        }
+
     class Parser(MySQL.Parser):
         def _parse_truncate_table(self):
             tree = super()._parse_truncate_table()
@@ -300,6 +306,7 @@ class Doris(MySQL):
             exp.ApproxDistinct: approx_count_distinct_sql,
             exp.ArgMax: rename_func("MAX_BY"),
             exp.ArgMin: rename_func("MIN_BY"),
+            exp.Array: rename_func("ARRAY"),
             exp.ArrayAgg: rename_func("COLLECT_LIST"),
             exp.ArrayUniqueAgg: rename_func("COLLECT_SET"),
             exp.CurrentTimestamp: lambda self, _: self.func("NOW"),

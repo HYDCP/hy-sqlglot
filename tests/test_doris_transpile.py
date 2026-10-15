@@ -1293,3 +1293,109 @@ if __name__ == "__main__":
 
     # Output summary
     run_summary()
+
+
+def test_date_integer_arithmetic_keeps_date_wrapper_for_to_char_inputs():
+    from sqlglot import exp
+    from sqlglot.contrib.doris_transpile import convert_date_arithmetic
+
+    tree = sqlglot.parse_one("SELECT DATE(TIMESTAMP '2026-10-15 12:34:56') - 1", read="postgres")
+    result = convert_date_arithmetic(tree)
+    date_add = result.find(exp.DateAdd)
+    assert isinstance(date_add.this, exp.Date)
+    assert isinstance(date_add.this.this, exp.Cast)
+    assert date_add.expression.this == "-1"
+
+
+def test_fixed_month_concat_preserves_runtime_fractions_and_single_evaluation():
+    sql = pg_to_doris("SELECT dt-(COALESCE(p,0)||'months')::INTERVAL FROM t")[0]
+    assert sql.count("COALESCE(p, 0)") == 1
+    assert "MICROSECONDS_SUB" in sql and "DATE_SUB" in sql
+    assert "DECIMAL(20, 18)" in sql and "DECIMAL(2, 0)" in sql
+    assert "DATETIMEV2(6)" in sql
+    sql = pg_to_doris("SELECT dt+(RANDOM()||'months')::INTERVAL FROM t")[0]
+    assert sql.count("RAND()") == 1
+    sql = pg_to_doris("SELECT dt-((CAST(p AS INT))||'MONTH')::INTERVAL FROM t")[0]
+    assert "INTERVAL CAST(p AS INT) MONTH" in sql
+    assert "ARRAY_MAP" not in sql
+
+
+def test_chained_fixed_month_intervals_rewrite_bottom_up():
+    for value in ("dt+(p||'month')::interval+(q||'month')::interval",
+                  "CAST(dt-(p||'month')::interval AS TIMESTAMP(6))+(q||'month')::interval"):
+        sql = pg_to_doris("SELECT " + value + " FROM t")[0]
+        assert "AS INTERVAL" not in sql
+        assert sql.count("ARRAY_MAP") == 2
+        assert sql.count("IS NULL") == 2
+        assert sql.count("ARRAY(p)") == 1 and sql.count("ARRAY(q)") == 1
+
+
+def test_extract_epoch_source_rewrite_and_immutability():
+    from sqlglot import exp, parse_one
+    from sqlglot.contrib.doris_transpile import rewrite_extract_epoch
+    source = "SELECT SUM(EXTRACT(EPOCH FROM (CAST(e AS TIMESTAMP(6))-CAST(s AS TIMESTAMP(6))))/60), EXTRACT(MONTH FROM d) FROM t"
+    tree = parse_one(source, read="adb")
+    before = tree.copy()
+    result = rewrite_extract_epoch(tree)
+    assert tree == before
+    assert tree.sql("adb") == before.sql("adb")
+    generated = result.sql(dialect="doris")
+    assert generated.count("MICROSECONDS_DIFF") == 1
+    assert "DECIMAL(27, 6)" in generated
+    assert "/ 60" in generated
+    assert result.find(exp.Extract).name == "MONTH"
+    for sql in ("EXTRACT(EPOCH FROM (2-1))", "EXTRACT(EPOCH FROM (INTERVAL '2 days'-INTERVAL '1 day'))"):
+        node = parse_one(sql, read="adb")
+        assert rewrite_extract_epoch(node) == node
+
+
+def test_extract_epoch_native_doris_and_other_units_unchanged():
+    from sqlglot import transpile
+    source = "SELECT EXTRACT(EPOCH FROM ts), EXTRACT(YEAR FROM ts) FROM t"
+    assert transpile_to_doris(source, read="doris", normalize_mode="none") == transpile(source, read="doris", write="doris")
+    for unit in ("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"):
+        sql = "SELECT EXTRACT(" + unit + " FROM CAST(ts AS TIMESTAMP)) FROM t"
+        assert transpile_to_doris(sql, read="adb", normalize_mode="none") == transpile(sql, read="adb", write="doris")
+
+
+def test_to_timestamp_format_tokens_and_java_compatibility():
+    from sqlglot import parse_one
+    for dialect in ("postgres", "adb"):
+        for fmt in ("yyyy-mm-dd hh24:mi:ss", "YYYY-MM-DD HH24:MI:SS"):
+            sql = "SELECT TO_TIMESTAMP(v, '" + fmt + "')"
+            tree = parse_one(sql, read=dialect)
+            assert tree.find(sqlglot.exp.StrToTime).args["format"].this == "%Y-%m-%d %H:%M:%S"
+            assert parse_one(tree.sql(dialect), read=dialect) == tree
+            generated = transpile_to_doris(sql, read=dialect)[0]
+            assert "'%Y-%m-%d %T'" in generated
+            assert "HH1224" not in generated
+        quoted = parse_one('SELECT TO_TIMESTAMP(v, \'yyyy-"MM"-dd "HH24" hh24:mi:ss\')', read=dialect)
+        assert quoted.find(sqlglot.exp.StrToTime).args["format"].this == "%Y-MM-%d HH24 %H:%M:%S"
+        assert parse_one(quoted.sql(dialect), read=dialect) == quoted
+        for name in ('"to_timestamp"', 'app.to_timestamp', 'app."TO_TIMESTAMP"'):
+            tree = parse_one("SELECT " + name + "(v,'YYYY')", read=dialect)
+            assert tree.find(sqlglot.exp.StrToTime) is None
+            assert tree.find(sqlglot.exp.Anonymous) is not None
+            assert parse_one(tree.sql(dialect, normalize_functions=False), read=dialect) == tree
+    for java, expected in (("yyyyMMdd", "%Y%m%d"), ("yyyy-MM-dd HH:mm:ss", "%Y-%m-%d %H:%i:%s")):
+        generated = transpile_to_doris("SELECT STR_TO_DATE(v, '" + java + "')", read="postgres")[0]
+        assert "'" + expected + "'" in generated
+
+
+
+def test_extract_epoch_recursive_temporal_casts_keep_source_tree():
+    from sqlglot import parse_one
+    from sqlglot.contrib.doris_transpile import rewrite_extract_epoch
+    for expression in (
+        "CAST(CAST(TIMESTAMPTZ '1970-01-01 08:00:00.000001+08' AS TIMESTAMP) AS TIMESTAMPTZ)",
+        "CAST(CAST(TO_TIMESTAMP(-1.000001) AS TIMESTAMP) AS DATE)",
+    ):
+        tree = parse_one("EXTRACT(EPOCH FROM " + expression + ")", read="adb")
+        before = tree.copy()
+        result = rewrite_extract_epoch(tree)
+        assert tree == before
+        assert tree.sql("adb") == before.sql("adb")
+        generated = pg_to_doris("SELECT EXTRACT(EPOCH FROM " + expression + ")")[0]
+        assert "FROM_UNIXTIME" not in generated and " AS DATETIME)" not in generated
+        assert generated.count("MICROSECONDS_DIFF") == 1
+        assert result is not tree

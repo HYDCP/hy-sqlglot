@@ -27,6 +27,32 @@ class TestADB(Validator):
             self.assertIsInstance(self.parse_one(f"{function}('20261015', 'YYYYMMDD')"), node)
         self.assertIsInstance(parse_one("TO_CHAR(v, 'YYYY')", read="postgres"), exp.TimeToStr)
 
+    def test_extrema_builtin_case_and_arity(self):
+        for name, kind in (("GREATEST", exp.Greatest), ("LEAST", exp.Least)):
+            for function in (name, name.lower(), name.title()):
+                with self.subTest(function=function):
+                    node = self.parse_one(f"SELECT {function}(a, NULL, b)").expressions[0]
+                    self.assertIsInstance(node, kind)
+                    self.assertEqual(len(node.expressions), 2)
+                    self.assertIsInstance(node.expressions[0], exp.Null)
+            with self.assertRaises(ParseError):
+                parse_one(f"SELECT {name}()", read="adb", error_level=ErrorLevel.IMMEDIATE)
+
+    def test_extrema_keeps_quoted_and_qualified_udf_identity(self):
+        for name in ("GREATEST", "greatest", "GrEaTeSt", "LEAST", "least", "LeAsT"):
+            for function in (f'"{name}"', f"app.{name}", f'app."{name}"'):
+                with self.subTest(function=function):
+                    tree = self.parse_one(f"SELECT {function}(a, b)")
+                    self.assertIsNone(tree.find(exp.Greatest, exp.Least))
+                    node = tree.find(exp.Anonymous)
+                    self.assertIsNotNone(node)
+                    if '"' in function:
+                        self.assertIsInstance(node.this, exp.Identifier)
+                        self.assertTrue(node.this.args["quoted"])
+                        self.assertEqual(node.this.this, name)
+                    rendered = tree.sql("adb", normalize_functions=False)
+                    self.assertEqual(self.parse_one(rendered), tree)
+
     def test_truncate_partition_structure_and_roundtrip(self):
         for source, target in (
             (
@@ -133,6 +159,43 @@ class TestADB(Validator):
         self.assertEqual(properties[1].args["value"].this, "literal DISTRIBUTED BY (x)")
         self.assertEqual(tree.sql("adb"), source)
         self.validate_identity('SELECT id AS "DISTRIBUTED" FROM source AS "DISTRIBUTED"')
+
+    def test_replicated_ctas_retains_query_and_source_roundtrip(self):
+        for prefix, query, gap in (
+            ("CREATE TABLE t", "SELECT * FROM source", " "),
+            ("CREATE TABLE t", "SELECT id FROM source", " "),
+            ("CREATE TABLE t", "SELECT id", " "),
+            ("CREATE TEMPORARY TABLE t", "(SELECT * FROM source WHERE id = 1)", ""),
+            ("CREATE TABLE t WITH (appendonly=TRUE, orientation=column)",
+             "(SELECT id FROM source)", ""),
+            ("CREATE TABLE t", "WITH q AS (SELECT * FROM source) SELECT * FROM q", " "),
+            ("CREATE TABLE t", "SELECT distributed, replicated FROM source", " "),
+            ('CREATE TABLE "DISTRIBUTED"',
+             'SELECT "REPLICATED" AS "DISTRIBUTED" FROM "REPLICATED" AS "DISTRIBUTED"', " "),
+        ):
+            source = f"{prefix} AS {query}{gap}DISTRIBUTED REPLICATED"
+            with self.subTest(source=source):
+                tree = self.parse_one(source)
+                self.assertIsInstance(tree, exp.Create)
+                self.assertEqual(tree.expression, self.parse_one(query))
+                distribution = tree.args["properties"].expressions[-1]
+                self.assertIsInstance(distribution, exp.DistributedByProperty)
+                self.assertEqual(distribution.args["kind"], "REPLICATED")
+                self.assertFalse(distribution.expressions)
+                regenerated = tree.sql("adb", unsupported_level=ErrorLevel.RAISE)
+                self.assertTrue(regenerated.endswith("DISTRIBUTED REPLICATED"))
+                self.assertEqual(self.parse_one(regenerated), tree)
+
+    def test_distribution_words_remain_ordinary_identifiers(self):
+        for source in (
+            "SELECT distributed, replicated FROM distributed AS replicated",
+            "SELECT distributed AS replicated FROM replicated AS distributed",
+            'SELECT "DISTRIBUTED", "REPLICATED" FROM "DISTRIBUTED" AS "REPLICATED"',
+            'SELECT id AS "DISTRIBUTED REPLICATED" FROM source AS "DISTRIBUTED"',
+        ):
+            with self.subTest(source=source):
+                tree = self.validate_identity(source)
+                self.assertIsNone(tree.find(exp.DistributedByProperty))
 
     def test_create_explicit_population_clause_retained(self):
         for population in ("WITH DATA", "WITH NO DATA"):

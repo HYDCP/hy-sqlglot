@@ -22,6 +22,9 @@ Usage:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
+import math
+from decimal import Decimal, ROUND_HALF_UP
 import re
 import typing as t
 
@@ -1373,6 +1376,8 @@ def convert_date_format_patterns(expression: exp.Expression) -> exp.Expression:
 
     # Find all StrToDate and StrToTime nodes
     for node in list(expression.find_all(exp.StrToDate)) + list(expression.find_all(exp.StrToTime)):
+        if node.meta.get("postgres_to_timestamp"):
+            continue
         format_arg = node.args.get("format")
         if format_arg and isinstance(format_arg, exp.Literal):
             original_format = format_arg.this
@@ -1869,7 +1874,7 @@ def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
         DATE '2026-01-01' + 30
 
     After (Doris):
-        DATE_ADD(DATE_TRUNC(CAST('2026-02-10' AS DATE), 'MONTH'), INTERVAL -1 DAY)
+        DATE_ADD(DATE(DATE_TRUNC(CAST('2026-02-10' AS DATE), 'MONTH')), INTERVAL -1 DAY)
         DATE_ADD(CURRENT_DATE, INTERVAL -7 DAY)
         DATE_ADD(CAST('2026-01-01' AS DATE), INTERVAL 30 DAY)
 
@@ -1889,9 +1894,9 @@ def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
             if isinstance(node, exp.Sub):
                 n = -n
 
-            # Unwrap redundant DATE() wrapper
-            # DATE(DATE_TRUNC(...)) → DATE_TRUNC(...)
-            date_expr = left.this if isinstance(left, exp.Date) else left
+            # DATE() truncates the time component and must stay inside the
+            # arithmetic, including when this expression feeds TO_CHAR.
+            date_expr = left
 
             # Build DATE_ADD(date_expr, INTERVAL n DAY)
             date_add = exp.DateAdd(
@@ -1910,7 +1915,7 @@ def convert_date_arithmetic(expression: exp.Expression) -> exp.Expression:
 
 # Matches one ``<sign?><digits><spaces><word>`` segment inside a PostgreSQL
 # compound interval literal such as ``'1 month -1 day'`` or ``'1 year 2 months'``.
-_COMPOUND_INTERVAL_RE = re.compile(r"([+-]?\d+)\s*([A-Za-z]+)")
+_COMPOUND_INTERVAL_RE = re.compile(r"([+-]?\s*\d+)\s*([A-Za-z]+)")
 
 
 def _parse_compound_interval(s: str) -> t.List[t.Tuple[int, str]]:
@@ -1927,13 +1932,15 @@ def _parse_compound_interval(s: str) -> t.List[t.Tuple[int, str]]:
         ''                      -> []
     """
     out: t.List[t.Tuple[int, str]] = []
+    if not re.fullmatch(r"\s*(?:[+-]?\s*\d+\s*[A-Za-z]+\s*)+", s):
+        return out
     for n_str, unit in _COMPOUND_INTERVAL_RE.findall(s):
         u = unit.upper()
         # MONTHS -> MONTH, DAYS -> DAY, HOURS -> HOUR, etc.
         # Keep MS/US-style abbreviations (no trailing S to strip) unchanged.
         if len(u) > 1 and u.endswith("S"):
             u = u[:-1]
-        out.append((int(n_str), u))
+        out.append((int(re.sub(r"\s+", "", n_str)), exp.TimeUnit.UNABBREVIATED_UNIT_NAME.get(u, u)))
     return out
 
 
@@ -2144,6 +2151,87 @@ def fold_interval_multiplication(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def fixed_month_interval_amount(cast: exp.Expression) -> t.Optional[exp.Expression]:
+    """Extract only a fixed MONTH suffix, retaining PG NULL propagation."""
+    if not (type(cast) is exp.Cast and cast.to.is_type(exp.DataType.Type.INTERVAL)):
+        return None
+    concat = cast.this.unnest()
+    if not isinstance(concat, exp.DPipe):
+        return None
+    suffix = concat.expression.unnest()
+    if not (isinstance(suffix, exp.Literal) and suffix.is_string
+            and suffix.this.strip().upper() in ("MONTH", "MONTHS")):
+        return None
+    return concat.this.unnest()
+
+
+def rewrite_fixed_month_intervals(expression: exp.Expression) -> exp.Expression:
+    """PG numeric months: calendar months, then 30-day fractions to microseconds.
+
+    Small bounded remainders avoid Doris' 32-bit microsecond delta and DECIMAL
+    scale reduction. These local casts do not constrain the input's value/type.
+    """
+    # Rewrite children before a host copies its left subtree (chained months).
+    for cast in reversed(list(expression.find_all(exp.Cast))):
+        amount = fixed_month_interval_amount(cast)
+        host = cast
+        while isinstance(host.parent, exp.Paren):
+            host = host.parent
+        parent = host.parent
+        if amount is None or not isinstance(parent, (exp.Add, exp.Sub)) or parent.expression is not host:
+            continue
+        integer = isinstance(amount, exp.Cast) and amount.to.this in exp.DataType.INTEGER_TYPES
+        if integer and amount.this.unnest().is_number:
+            # PG numeric literal -> integer rounds; Doris' integer CAST truncates.
+            number = Decimal(amount.this.unnest().sql()).to_integral_value(rounding=ROUND_HALF_UP)
+            amount = exp.Literal.number(str(number))
+        # A singleton lambda keeps the quantity and scheduler markers once,
+        # including volatile expressions, without adding a query-level scope.
+        bind = not integer
+        name = "_interval_months"
+        existing = {n.name.lower() for n in expression.find_all(exp.Identifier)}
+        while name in existing:
+            name += "_"
+        value = exp.column(name) if bind else amount.copy()
+        # Construct arithmetic as ASTs with explicit parentheses on subtraction.
+        def trunc(node: exp.Expression) -> exp.Expression:
+            return exp.Anonymous(this="TRUNCATE", expressions=[node.copy(), exp.Literal.number(0)])
+        months = value if integer else trunc(value)
+        units = [(months, "MONTH")]
+        if not integer:
+            days = exp.Paren(this=exp.Sub(this=value.copy(), expression=months.copy())) * 30
+            whole_days = trunc(days)
+            remainder = exp.Paren(this=exp.Sub(this=exp.cast(days.copy(), "DECIMAL(20,18)"),
+                                              expression=exp.cast(whole_days.copy(), "DECIMAL(2,0)")))
+            micros = exp.Round(this=remainder * exp.cast(86400000000, "DECIMAL(11,0)"), decimals=exp.Literal.number(0))
+            seconds = trunc(exp.Div(this=micros.copy(), expression=exp.Literal.number(1000000)))
+            rest = exp.Sub(this=micros.copy(), expression=seconds.copy() * 1000000)
+            units.extend([(whole_days, "DAY"), (seconds, "SECOND"), (rest, "MICROSECOND")])
+        base = parent.this.copy()
+        if (type(base) is exp.Cast and base.to.this == exp.DataType.Type.TIMESTAMP
+                and not base.to.expressions):
+            base.set("to", exp.DataType.build("TIMESTAMP(6)"))
+        result = exp.Cast(this=base, to=exp.DataType.build("TIMESTAMP(6)"))
+        operation = exp.DateAdd if isinstance(parent, exp.Add) else exp.DateSub
+        for quantity, unit in units:
+            delta = exp.cast(quantity.copy(), "INT")
+            if unit == "MICROSECOND":
+                result = exp.Anonymous(this="MICROSECONDS_ADD" if operation is exp.DateAdd else "MICROSECONDS_SUB",
+                                       expressions=[result, delta])
+            else:
+                result = operation(this=result, expression=delta, unit=exp.Var(this=unit))
+        if bind:
+            # Doris' nested array lambdas can otherwise turn a NULL outer
+            # delta into zero; guard the bound value before date arithmetic.
+            result = exp.If(this=exp.Is(this=value.copy(), expression=exp.Null()),
+                            true=exp.Null(), false=result)
+            result = exp.Bracket(this=exp.Anonymous(this="ARRAY_MAP", expressions=[
+                exp.Lambda(this=result, expressions=[exp.to_identifier(name)]),
+                exp.Array(expressions=[amount.copy()])]), expressions=[exp.Literal.number(1)])
+        parent.replace(result)
+    return expression
+
+
 def _extract_unit_name(unit_node: t.Optional[exp.Expression]) -> str:
     if isinstance(unit_node, exp.Var):
         return unit_node.name.upper()
@@ -2190,6 +2278,157 @@ def _coerce_pg_unknown_interval_literals(node: exp.Expression) -> exp.Expression
             op.set("expression", interval)
 
     return node
+
+
+def _epoch_kind(node: exp.Expression) -> t.Optional[str]:
+    """Local source syntax only; unknown columns need no metadata proof."""
+    node = node.unnest()
+    if isinstance(node, exp.Column):
+        return "unknown"
+    if isinstance(node, exp.Cast):
+        if node.to.is_type(exp.DataType.Type.TIMESTAMPTZ):
+            return "aware"
+        if node.to.is_type(exp.DataType.Type.TIMESTAMP, exp.DataType.Type.DATETIME):
+            return "nominal"
+        if node.to.is_type(exp.DataType.Type.DATE):
+            return "date"
+    if isinstance(node, exp.StrToTime) and node.meta.get("postgres_to_timestamp"):
+        return "aware"
+    if isinstance(node, (exp.CurrentTimestamp, exp.UnixToTime)):
+        return "aware"
+    if isinstance(node, exp.Null):
+        return "null"
+    return None
+
+
+def _epoch_unix_literal_seconds(node: exp.UnixToTime) -> t.Optional[exp.Expression]:
+    """Match PG float8_timestamptz's double rounding relative to its 2000 epoch."""
+    argument = node.this.unnest()
+    literal = argument.this if isinstance(argument, exp.Neg) else argument
+    if isinstance(literal, exp.Null):
+        return exp.cast(literal.copy(), "DECIMAL(27,6)")
+    if isinstance(literal, exp.Literal) and literal.is_number:
+        number = float(literal.this) * (-1 if isinstance(argument, exp.Neg) else 1)
+        if math.isfinite(number):
+            micros = round((number - 946684800) * 1000000) + 946684800000000
+            return exp.cast(exp.Literal.number(str(Decimal(micros) / Decimal(1000000))),
+                            "DECIMAL(27,6)")
+    return None
+
+
+def _epoch_datetime(node: exp.Expression, kind: str) -> exp.Expression:
+    node = node.copy().unnest()
+    source_tz = exp.Var(this="@@session.time_zone")
+    if isinstance(node, exp.UnixToTime):
+        seconds = _epoch_unix_literal_seconds(node)
+        if seconds is not None:
+            value = seconds.this
+            if not isinstance(value, exp.Null):
+                try:
+                    value = exp.Literal.string((datetime(1970, 1, 1) + timedelta(
+                        microseconds=int(Decimal(value.this) * 1000000))).isoformat(
+                            sep=" ", timespec="microseconds"))
+                except OverflowError:
+                    value = None  # Outside Doris/Python datetime range: retain existing mapping.
+            if value is not None:
+                return exp.cast(value, "TIMESTAMP(6)")  # Already UTC, including negative epochs.
+    if isinstance(node, exp.Cast):
+        inner_kind = _epoch_kind(node.this)
+        if inner_kind in ("aware", "nominal", "date"):
+            value = _epoch_datetime(node.this, inner_kind)
+            if inner_kind == "aware":
+                if kind == "aware":
+                    source_tz = exp.Literal.string("+00:00")
+                else:
+                    value = exp.ConvertTimezone(source_tz=exp.Literal.string("+00:00"),
+                        target_tz=source_tz.copy(), timestamp=value)
+            node.set("this", value)
+    if isinstance(node, (exp.Cast, exp.StrToTime)):
+        value = node.this
+        if isinstance(value, exp.Literal) and value.is_string:
+            # Preserve a known original offset before casting to Doris' timezone-
+            # free DATETIMEV2. Nonliteral inputs use the documented session rule.
+            match = re.search(r"(Z|[+-]\d{2}(?::?\d{2})?)$", value.this, re.I)
+            if match and (":" in value.this[:match.start()] or " " in value.this[:match.start()]):
+                offset = match.group(1)
+                if offset.upper() == "Z":
+                    offset = "+00:00"
+                elif len(offset) == 3:
+                    offset += ":00"
+                elif len(offset) == 5:
+                    offset = offset[:3] + ":" + offset[3:]
+                # TO_TIMESTAMP needs an explicit timezone token as well.
+                fmt = node.args.get("format")
+                if isinstance(node, exp.Cast) or (kind == "aware" and isinstance(fmt, exp.Literal) and fmt.this.endswith("%z")):
+                    if kind == "aware":
+                        source_tz = exp.Literal.string(offset)
+                    node.set("this", exp.Literal.string(value.this[:match.start()].rstrip()))
+                    if isinstance(node, exp.StrToTime):
+                        node.set("format", exp.Literal.string(fmt.this[:-2].rstrip()))
+        if isinstance(node, exp.Cast) and not node.to.is_type(exp.DataType.Type.DATE):
+            # Preserve an explicit precision. Only PostgreSQL's omitted
+            # timestamp precision needs the default six digits in Doris.
+            target = node.to.copy() if node.to.expressions else exp.DataType.build("TIMESTAMP(6)")
+            target.set("this", exp.DataType.Type.TIMESTAMP)
+            node.set("to", target)
+    if kind == "aware":
+        return exp.ConvertTimezone(source_tz=source_tz,
+            target_tz=exp.Literal.string("+00:00"), timestamp=node)
+    return node
+
+
+def rewrite_extract_epoch(expression: exp.Expression) -> exp.Expression:
+    """PG timestamp differences use exact decimal seconds, never integer diff.
+
+    Explicit TIMESTAMP is nominal; TO_TIMESTAMP/TIMESTAMPTZ are absolute.
+    Unknown standalone columns retain the existing UNIX_TIMESTAMP mapping.
+    """
+    result = expression.copy()
+    for extract in reversed(list(result.find_all(exp.Extract))):
+        if _extract_unit_name(extract.this) != "EPOCH":
+            continue
+        value = extract.expression.unnest()
+        if isinstance(value, exp.Sub):
+            end, start = value.this, value.expression
+            end_kind, start_kind = _epoch_kind(end), _epoch_kind(start)
+            if not end_kind or not start_kind or end_kind == start_kind == "date":
+                continue
+            endpoints = [_epoch_datetime(end, end_kind), _epoch_datetime(start, start_kind)]
+            if "aware" in (end_kind, start_kind):
+                # PG coerces a nominal timestamp/date to the session timezone
+                # when its peer is timestamptz. Keep the original CAST first.
+                for index, kind in enumerate((end_kind, start_kind)):
+                    if kind not in ("aware", "null"):
+                        endpoints[index] = exp.ConvertTimezone(
+                            source_tz=exp.Var(this="@@session.time_zone"),
+                            target_tz=exp.Literal.string("+00:00"), timestamp=endpoints[index])
+            diff = exp.Anonymous(this="MICROSECONDS_DIFF", expressions=endpoints)
+        elif isinstance(value, exp.UnixToTime):
+            seconds = _epoch_unix_literal_seconds(value)
+            if seconds is None:
+                continue  # Dynamic epochs keep the existing mapping and range hint.
+            seconds.add_comments(extract.comments)
+            if extract is result:
+                result = seconds
+            else:
+                extract.replace(seconds)
+            continue
+        else:
+            kind = _epoch_kind(value)
+            if kind not in ("nominal", "aware", "date", "null"):
+                continue
+            diff = exp.Anonymous(this="MICROSECONDS_DIFF", expressions=[
+                _epoch_datetime(value, kind),
+                exp.cast(exp.Literal.string("1970-01-01 00:00:00"),
+                         "TIMESTAMP(6)")])
+        seconds = exp.Paren(this=exp.Div(
+            this=exp.cast(diff, "DECIMAL(27,6)"), expression=exp.Literal.number(1000000)))
+        seconds.add_comments(extract.comments)
+        if extract is result:
+            result = seconds
+        else:
+            extract.replace(seconds)
+    return result
 
 
 def rewrite_date_part_day_diff_to_datediff(expression: exp.Expression) -> exp.Expression:
@@ -3404,7 +3643,7 @@ def preprocess_negative_interval(sql: str) -> str:
         keyword, n, unit = m.group(2), m.group(3), m.group(4).upper()
         if len(unit) > 1 and unit.endswith("S"):
             unit = unit[:-1]
-        return f"{keyword} '{n}' {unit}"
+        return f"{keyword} '{n}' {unit} "
 
     return _INTERVAL_PREPROCESS_RE.sub(_sub, sql)
 
@@ -3813,6 +4052,11 @@ def transpile_to_doris(
             if auto_add_create_table_if_not_exists:
                 normalized = add_if_not_exists_to_create_table(normalized)
 
+            # EPOCH has PostgreSQL source semantics only; native Doris input
+            # keeps its own EXTRACT behavior.
+            if isinstance(Dialect.get_or_raise(read), Postgres) and isinstance(write_dialect, Doris):
+                normalized = rewrite_extract_epoch(normalized)
+
             # Convert date arithmetic (date +/- integer) to DATE_ADD with INTERVAL
             if convert_date_arith:
                 normalized = convert_date_arithmetic(normalized)
@@ -3826,6 +4070,7 @@ def transpile_to_doris(
             if convert_compound_interval:
                 normalized = expand_compound_interval(normalized)
                 normalized = fold_interval_multiplication(normalized)
+                normalized = rewrite_fixed_month_intervals(normalized)
 
             # Normalize DATE_TRUNC unit names to Doris singular forms
             # (PG accepts plurals like 'months'/'days'; Doris does not).
@@ -4012,6 +4257,7 @@ __all__ = [
     "rewrite_to_char_numeric",
     "convert_age_in_extract",
     "rewrite_date_part_day_diff_to_datediff",
+    "rewrite_extract_epoch",
     "drop_sequence_columns",
     "preprocess_date_cast_syntax",
     "preprocess_delete_trailing_force",

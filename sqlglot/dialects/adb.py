@@ -12,7 +12,20 @@ class ADB(Postgres):
         FUNCTION_PARSERS = {
             **Postgres.Parser.FUNCTION_PARSERS,
             "TO_CHAR": lambda self: self._parse_to_char(),
+            "GREATEST": lambda self: self._parse_extrema(exp.Greatest),
+            "LEAST": lambda self: self._parse_extrema(exp.Least),
         }
+
+        def _parse_extrema(self, kind):
+            name = self._tokens[self._index - 2]
+            args = self._parse_csv(lambda: self._parse_lambda(alias=False))
+            if name.token_type == TokenType.IDENTIFIER:
+                return self.expression(
+                    exp.Anonymous,
+                    this=exp.Identifier(this=name.text, quoted=True),
+                    expressions=args,
+                )
+            return self.validate_expression(kind.from_arg_list(args), args)
 
         def _parse_to_char(self):
             name = self._tokens[self._index - 2]
@@ -67,7 +80,7 @@ class ADB(Postgres):
                 return False
             return self._match_text_seq("DISTRIBUTED", "BY", advance=False) or self._match_text_seq(
                 "DISTRIBUTED", "RANDOMLY", advance=False
-            )
+            ) or self._match_text_seq("DISTRIBUTED", "REPLICATED", advance=False)
 
         def _parse_alias(self, this, explicit=False):
             if self._distribution_clause():
@@ -90,6 +103,8 @@ class ADB(Postgres):
                 )
             if self._match_text_seq("RANDOMLY"):
                 return self.expression(exp.DistributedByProperty, kind="RANDOM")
+            if self._match_text_seq("REPLICATED"):
+                return self.expression(exp.DistributedByProperty, kind="REPLICATED")
             return super()._parse_distributed_property()
 
         def _parse_alter_table_add(self):
@@ -207,6 +222,8 @@ class ADB(Postgres):
                 self.unsupported("ADB distribution does not support BUCKETS or ORDER BY")
             if expression.args.get("kind") == "RANDOM":
                 return "DISTRIBUTED RANDOMLY"
+            if expression.args.get("kind") == "REPLICATED":
+                return "DISTRIBUTED REPLICATED"
             return f"DISTRIBUTED BY ({self.expressions(expression, flat=True)})"
 
         def partitionboundspec_sql(self, expression):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing as t
+import re
 
 from sqlglot import exp, generator, parser, tokens, transforms
 from sqlglot.dialects.dialect import (
@@ -177,7 +178,31 @@ def _build_to_timestamp(args: t.List) -> exp.UnixToTime | exp.StrToTime:
         return exp.UnixToTime.from_arg_list(args)
 
     # https://www.postgresql.org/docs/current/functions-formatting.html
-    return build_formatted_time(exp.StrToTime, "postgres")(args)
+    node = build_formatted_time(exp.StrToTime, "postgres")(args)
+    raw = seq_get(args, 1)
+    if isinstance(raw, exp.Literal) and raw.is_string:
+        # PostgreSQL tokens are case insensitive. Match once so MM/MI and
+        # HH24 cannot be reinterpreted by the Java compatibility transform.
+        mapping = {key.upper(): value for key, value in Postgres.TIME_MAPPING.items()}
+        mapping.update({"TZH:TZM": "%z", "TZHTZM": "%z", "TZH": "%z"})
+        pattern = r'"(?:[^"\\]|\\.)*"|' + "|".join(
+            re.escape(key) for key in sorted(mapping, key=len, reverse=True)
+        )
+        def replace(match):
+            token = match.group()
+            if token.startswith('"'):
+                return re.sub(r"\\(.)", r"\1", token[1:-1]).replace("%", "%%")
+            return mapping[token.upper()]
+        node.set("format", exp.Literal.string(re.sub(pattern, replace, raw.this, flags=re.I)))
+        node.meta["postgres_timestamp_format"] = raw.this
+    node.meta["postgres_to_timestamp"] = True
+    return node
+
+
+def _to_timestamp_sql(self, expression):
+    raw = expression.meta.get("postgres_timestamp_format")
+    fmt = exp.Literal.string(raw) if raw is not None else self.format_time(expression)
+    return self.func("TO_TIMESTAMP", expression.this, fmt)
 
 
 def _json_extract_sql(
@@ -353,6 +378,17 @@ class Postgres(Dialect):
         VAR_SINGLE_TOKENS = {"$"}
 
     class Parser(parser.Parser):
+        def _parse_to_timestamp(self):
+            name = self._tokens[self._index - 2]
+            args = self._parse_csv(lambda: self._parse_lambda(alias=False))
+            if name.token_type == TokenType.IDENTIFIER:
+                return self.expression(exp.Anonymous,
+                    this=exp.Identifier(this=name.text, quoted=True), expressions=args)
+            if len(args) not in (1, 2):
+                self.raise_error("TO_TIMESTAMP requires one or two arguments")
+                return None
+            return self.validate_expression(_build_to_timestamp(args), args)
+
         PROPERTY_PARSERS = {
             **parser.Parser.PROPERTY_PARSERS,
             "SET": lambda self: self.expression(exp.SetConfigProperty, this=self._parse_set()),
@@ -393,6 +429,7 @@ class Postgres(Dialect):
 
         FUNCTION_PARSERS = {
             **parser.Parser.FUNCTION_PARSERS,
+            "TO_TIMESTAMP": lambda self: self._parse_to_timestamp(),
             "DATE_PART": lambda self: self._parse_date_part(),
             "JSONB_EXISTS": lambda self: self._parse_jsonb_exists(),
         }
@@ -587,7 +624,7 @@ class Postgres(Dialect):
             exp.SHA2: sha256_sql,
             exp.StrPosition: lambda self, e: strposition_sql(self, e, func_name="POSITION"),
             exp.StrToDate: lambda self, e: self.func("TO_DATE", e.this, self.format_time(e)),
-            exp.StrToTime: lambda self, e: self.func("TO_TIMESTAMP", e.this, self.format_time(e)),
+            exp.StrToTime: _to_timestamp_sql,
             exp.StructExtract: struct_extract_sql,
             exp.Substring: _substring_sql,
             exp.TimeFromParts: rename_func("MAKE_TIME"),
