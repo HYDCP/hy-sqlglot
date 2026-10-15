@@ -25,6 +25,20 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
     )
 
 
+def _build_date_trunc(args: list[exp.Expression]) -> exp.TimestampTrunc:
+    # Doris accepts both argument orders. Only a literal time unit identifies
+    # the unit-first form; datetime columns and expressions must stay in this.
+    first = args[0] if args else None
+    if (
+        isinstance(first, exp.Literal)
+        and first.is_string
+        and first.this.upper()
+        in {"SECOND", "MINUTE", "HOUR", "DAY", "WEEK", "MONTH", "QUARTER", "YEAR"}
+    ):
+        return build_timestamp_trunc(args)
+    return exp.TimestampTrunc.from_arg_list(args)
+
+
 class Doris(MySQL):
     DATE_FORMAT = "'yyyy-MM-dd'"
     DATEINT_FORMAT = "'yyyyMMdd'"
@@ -39,7 +53,7 @@ class Doris(MySQL):
         FUNCTIONS = {
             **MySQL.Parser.FUNCTIONS,
             "COLLECT_SET": exp.ArrayUniqueAgg.from_arg_list,
-            "DATE_TRUNC": build_timestamp_trunc,
+            "DATE_TRUNC": _build_date_trunc,
             "MONTHS_ADD": exp.AddMonths.from_arg_list,
             "REGEXP": exp.RegexpLike.from_arg_list,
             "TO_DATE": exp.TsOrDsToDate.from_arg_list,
@@ -51,18 +65,28 @@ class Doris(MySQL):
         def _parse_alter_table_add(self):
             if not self._match(TokenType.PARTITION, advance=False):
                 return super()._parse_alter_table_add()
-            return self._parse_csv(self._parse_add_range_partition)
+            index = self._index
+            actions = self._parse_csv(self._parse_add_range_partition)
+            if actions:
+                return actions
+            self._retreat(index)
+            return super()._parse_alter_table_add()
 
         def _parse_add_range_partition(self):
+            index = self._index
             self._match_text_seq("ADD")
             if not self._match(TokenType.PARTITION):
-                self.raise_error("Expecting PARTITION")
+                if self._curr is None:
+                    self.raise_error("Expecting PARTITION")
+                self._retreat(index)
+                return None
             exists = self._parse_exists(not_=True)
             name = self._parse_id_var(any_token=False)
-            if not self._match(TokenType.VALUES) or not self._match(
-                TokenType.L_BRACKET
+            if name is None or not self._match_pair(
+                TokenType.VALUES, TokenType.L_BRACKET
             ):
-                self.raise_error("Expecting VALUES [")
+                self._retreat(index)
+                return None
             lower = self._parse_wrapped_csv(self._parse_assignment)
             if not self._match(TokenType.COMMA):
                 self.raise_error("Expecting comma between partition bounds")
