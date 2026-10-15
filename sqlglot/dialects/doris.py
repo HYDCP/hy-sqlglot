@@ -45,6 +45,27 @@ class Doris(MySQL):
     TIME_FORMAT = "'yyyy-MM-dd HH:mm:ss'"
 
     class Parser(MySQL.Parser):
+        def _parse_truncate_table(self):
+            tree = super()._parse_truncate_table()
+            if isinstance(tree, exp.TruncateTable):
+                if len(tree.expressions) == 1 and isinstance(
+                    tree.expressions[0], exp.Table
+                ):
+                    table = tree.expressions[0]
+                    if table.args.get("partition") is not None:
+                        tree.set("partition", table.args.pop("partition"))
+                partition = tree.args.get("partition")
+                if isinstance(partition, exp.Partition):
+                    partition.set(
+                        "expressions",
+                        [
+                            value.this
+                            if isinstance(value, exp.Column) and len(value.parts) == 1
+                            else value
+                            for value in partition.expressions
+                        ],
+                    )
+            return tree
         PROPERTY_PARSERS = {
             **MySQL.Parser.PROPERTY_PARSERS,
             "PROPERTIES": lambda self: self._parse_wrapped_properties(),
@@ -126,6 +147,37 @@ class Doris(MySQL):
 
     class Generator(MySQL.Generator):
         WITH_PROPERTIES_PREFIX = "PROPERTIES"
+
+        def truncatetable_sql(self, expression):
+            partition = expression.args.get("partition")
+            if (
+                any(
+                    expression.args.get(key)
+                    for key in (
+                        "is_database",
+                        "exists",
+                        "only",
+                        "cluster",
+                        "identity",
+                        "option",
+                    )
+                )
+                or len(expression.expressions) != 1
+            ):
+                self.unsupported(
+                    "Doris TRUNCATE requires one table without source options"
+                )
+            if partition is not None and not (
+                isinstance(partition, exp.Partition)
+                and not partition.args.get("subpartition")
+                and partition.expressions
+                and all(isinstance(name, exp.Identifier) for name in partition.expressions)
+            ):
+                self.unsupported(
+                    "Doris partition TRUNCATE requires explicit partition names"
+                )
+                return ""
+            return super().truncatetable_sql(expression)
 
         def addpartition_sql(self, expression):
             if not isinstance(expression.this, exp.Identifier):

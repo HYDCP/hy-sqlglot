@@ -9,6 +9,40 @@ class ADB(Postgres):
     """AnalyticDB for PostgreSQL's distribution and named partition syntax."""
 
     class Parser(Postgres.Parser):
+        ALTER_PARSERS = {
+            **Postgres.Parser.ALTER_PARSERS,
+            "TRUNCATE": lambda self: self._parse_truncate_partition(),
+        }
+
+        def _parse_truncate_partition(self):
+            if not self._match(TokenType.PARTITION):
+                self.raise_error("Expecting PARTITION")
+            if self._match(TokenType.FOR):
+                values = self._parse_wrapped_csv(self._parse_assignment)
+                if not values:
+                    self.raise_error("Expecting partition selector")
+                return self.expression(exp.Tuple, expressions=values)
+            name = self._parse_id_var(any_token=False)
+            if name is None:
+                self.raise_error("Expecting partition name")
+            return self.expression(exp.Partition, expressions=[name])
+
+        def _parse_alter(self):
+            tree = super()._parse_alter()
+            if isinstance(tree, exp.Alter):
+                actions = tree.args.get("actions") or []
+                if len(actions) == 1 and isinstance(
+                    actions[0], (exp.Partition, exp.Tuple)
+                ):
+                    if tree.args.get("kind") != "TABLE" or any(
+                        tree.args.get(key)
+                        for key in ("exists", "only", "options", "cluster", "not_valid")
+                    ):
+                        self.raise_error("Unsupported ALTER TRUNCATE options")
+                    return self.expression(
+                        exp.TruncateTable, expressions=[tree.this], partition=actions[0]
+                    )
+            return tree
         def _distribution_clause(self):
             if self._match(TokenType.IDENTIFIER, advance=False):
                 return False
@@ -111,6 +145,39 @@ class ADB(Postgres):
             )
 
     class Generator(Postgres.Generator):
+        def truncatetable_sql(self, expression):
+            partition = expression.args.get("partition")
+            if partition is None:
+                return super().truncatetable_sql(expression)
+            if len(expression.expressions) != 1 or any(
+                expression.args.get(key)
+                for key in (
+                    "is_database",
+                    "exists",
+                    "only",
+                    "cluster",
+                    "identity",
+                    "option",
+                )
+            ):
+                self.unsupported(
+                    "ADB partition TRUNCATE requires one table without options"
+                )
+            if isinstance(partition, exp.Tuple):
+                selector = f"FOR {self.sql(partition)}"
+            elif (
+                isinstance(partition, exp.Partition)
+                and not partition.args.get("subpartition")
+                and len(partition.expressions) == 1
+                and isinstance(partition.expressions[0], exp.Identifier)
+            ):
+                selector = self.sql(partition.expressions[0])
+            else:
+                self.unsupported(
+                    "ADB partition TRUNCATE requires a name or FOR selector"
+                )
+                return ""
+            return f"ALTER TABLE {self.expressions(expression)} TRUNCATE PARTITION {selector}"
         PROPERTIES_LOCATION = {
             **Postgres.Generator.PROPERTIES_LOCATION,
             exp.DistributedByProperty: exp.Properties.Location.POST_EXPRESSION,

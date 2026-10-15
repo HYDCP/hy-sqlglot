@@ -5,6 +5,23 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_truncate_multiple_named_partitions(self):
+        for source in (
+            "TRUNCATE TABLE raw.fact PARTITION(p1, p2)",
+            "TRUNCATE TABLE `raw`.`Fact` PARTITION(`set`, `other`)",
+        ):
+            with self.subTest(source=source):
+                tree = self.validate_identity(source)
+                self.assertTrue(
+                    all(
+                        isinstance(name, exp.Identifier)
+                        for name in tree.args["partition"].expressions
+                    )
+                )
+                self.assertEqual(
+                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE), source
+                )
+
     def test_doris(self):
         self.validate_all(
             "SELECT TO_DATE('2020-02-02 00:00:00')",

@@ -5,6 +5,82 @@ from tests.dialects.test_dialect import Validator
 class TestADB(Validator):
     dialect = "adb"
 
+    def test_truncate_partition_structure_and_roundtrip(self):
+        for source, target in (
+            (
+                "ALTER TABLE raw.t TRUNCATE PARTITION p1",
+                "TRUNCATE TABLE raw.t PARTITION(p1)",
+            ),
+            (
+                'ALTER TABLE "raw"."T" TRUNCATE PARTITION "set"',
+                "TRUNCATE TABLE `raw`.`T` PARTITION(`set`)",
+            ),
+        ):
+            tree = self.validate_identity(source)
+            self.assertIsInstance(tree, exp.TruncateTable)
+            self.assertIsInstance(tree.args["partition"], exp.Partition)
+            original = tree.copy()
+            self.assertEqual(
+                tree.sql("doris", unsupported_level=ErrorLevel.RAISE), target
+            )
+            self.assertEqual(tree, original)
+            target_tree = parse_one(
+                target, read="doris", error_level=ErrorLevel.IMMEDIATE
+            )
+            self.assertIsInstance(
+                target_tree.args["partition"].expressions[0], exp.Identifier
+            )
+            self.assertEqual(target_tree.sql("adb"), source)
+        self.validate_identity("TRUNCATE TABLE raw.t")
+
+    def test_truncate_for_preserves_selector_without_guessing_name(self):
+        for value in ("DATE '20261014'", "'20261014'", "1, 2", "DATE '${day + 1}'"):
+            source = f"ALTER TABLE raw.t TRUNCATE PARTITION FOR ({value})"
+            tree = self.parse_one(source)
+            self.assertIsInstance(tree, exp.TruncateTable)
+            self.assertIsInstance(tree.args["partition"], exp.Tuple)
+            regenerated = tree.sql("adb")
+            self.assertEqual(parse_one(regenerated, read="adb"), tree)
+            with self.assertRaises(UnsupportedError):
+                tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+
+    def test_truncate_partition_options_cannot_become_whole_table(self):
+        for source in (
+            "ALTER TABLE ONLY raw.t TRUNCATE PARTITION p1",
+            "ALTER TABLE IF EXISTS raw.t TRUNCATE PARTITION p1",
+            "ALTER VIEW raw.t TRUNCATE PARTITION p1",
+            "ALTER TABLE raw.t TRUNCATE PARTITION p1 CASCADE",
+            "ALTER TABLE raw.t TRUNCATE PARTITION p1 RESTART IDENTITY",
+            "ALTER TABLE raw.t TRUNCATE PARTITION p1, TRUNCATE PARTITION p2",
+            "ALTER TABLE raw.t TRUNCATE PARTITION p1, ADD COLUMN x INT",
+            "ALTER TABLE raw.t TRUNCATE PARTITION FOR ()",
+            "ALTER TABLE raw.t TRUNCATE PARTITION",
+        ):
+            with self.subTest(source=source):
+                try:
+                    tree = parse_one(
+                        source, read="adb", error_level=ErrorLevel.IMMEDIATE
+                    )
+                except ParseError:
+                    continue
+                self.assertIsInstance(tree, exp.Command)
+
+    def test_doris_truncate_generator_rejects_source_options_and_complex_selectors(
+        self,
+    ):
+        for source in (
+            "TRUNCATE TABLE t RESTART IDENTITY",
+            "TRUNCATE TABLE t CASCADE",
+            "TRUNCATE TABLE t, u",
+            "TRUNCATE TABLE t PARTITION(p1, p2 + 1)",
+            "TRUNCATE TABLE t PARTITION(p1 + 1)",
+            "TRUNCATE TABLE t SUBPARTITION(p1)",
+        ):
+            with self.subTest(source=source):
+                tree = parse_one(source, read="doris", error_level=ErrorLevel.IMMEDIATE)
+                with self.assertRaises(UnsupportedError):
+                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+
     def test_create_distribution(self):
         for source, target in (
             ("CREATE TABLE t (id INT, payload VARCHAR(8)) DISTRIBUTED BY (id, payload)",
