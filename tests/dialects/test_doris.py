@@ -8,6 +8,27 @@ class TestDoris(Validator):
     def test_native_array_constructor_round_trip(self):
         self.validate_identity("SELECT ARRAY(1, NULL, 3)")
 
+    def test_null_ordering_native_where_case_emulation_cannot_apply(self):
+        self.validate_all(
+            "SELECT a FROM t ORDER BY 1 NULLS LAST",
+            read={"postgres": "SELECT a FROM t ORDER BY 1"},
+        )
+        self.validate_all(
+            "SELECT a FROM t ORDER BY 1 DESC NULLS FIRST",
+            read={"postgres": "SELECT a FROM t ORDER BY 1 DESC"},
+        )
+        self.validate_all(
+            "SELECT SUM(x) OVER (ORDER BY y NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+            read={
+                "postgres": "SELECT SUM(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+            },
+        )
+        # Column sort keys keep the CASE WHEN emulation.
+        self.validate_all(
+            "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a",
+            read={"postgres": "SELECT a FROM t ORDER BY a"},
+        )
+
     def test_truncate_multiple_named_partitions(self):
         for source in (
             "TRUNCATE TABLE raw.fact PARTITION(p1, p2)",

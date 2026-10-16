@@ -154,6 +154,22 @@ class Doris(MySQL):
     class Generator(MySQL.Generator):
         WITH_PROPERTIES_PREFIX = "PROPERTIES"
 
+        def ordered_sql(self, expression: exp.Ordered) -> str:
+            # Doris parses ORDER BY ... NULLS FIRST/LAST natively. Use it where the
+            # inherited CASE WHEN emulation cannot apply: query ordinals and framed
+            # windows (an integer in a window ORDER BY is a constant, not an ordinal).
+            window = expression.find_ancestor(exp.Window, exp.Select)
+            in_window = isinstance(window, exp.Window)
+            if (expression.this.is_int and not in_window) or (
+                in_window and window.args.get("spec")
+            ):
+                self.NULL_ORDERING_SUPPORTED = True
+                try:
+                    return super().ordered_sql(expression)
+                finally:
+                    del self.NULL_ORDERING_SUPPORTED
+            return super().ordered_sql(expression)
+
         def truncatetable_sql(self, expression):
             partition = expression.args.get("partition")
             if (
