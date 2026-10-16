@@ -1219,6 +1219,29 @@ FROM json_data, field_ids""",
         self.validate_identity("SELECT 1 OPERATOR(+) /* foo */ 2")
         self.validate_identity("SELECT 1 OPERATOR(pg_catalog.+) 2")
 
+    def test_typed_literal_postfix_cast(self):
+        for sql, inner in (
+            ("DATE '2024-01-01'::VARCHAR", exp.DataType.Type.DATE),
+            ("DATE'1900-01-01'::TIMESTAMP", exp.DataType.Type.DATE),
+            ("TIMESTAMP '2024-01-01 10:00:00'::DATE", exp.DataType.Type.TIMESTAMP),
+        ):
+            with self.subTest(sql):
+                cast = self.parse_one(sql)
+                cast.assert_is(exp.Cast)
+                cast.this.assert_is(exp.Cast)
+                self.assertTrue(cast.this.to.is_type(inner))
+                self.assertTrue(cast.this.this.is_string)
+
+        self.validate_identity(
+            "SELECT SUBSTR(DATE '2024-01-01'::VARCHAR, 1, 7)",
+            "SELECT SUBSTRING(CAST(CAST('2024-01-01' AS DATE) AS VARCHAR) FROM 1 FOR 7)",
+        )
+        self.validate_identity(
+            "SELECT COALESCE(x, DATE'1900-01-01'::TIMESTAMP) <= y",
+            "SELECT COALESCE(x, CAST(CAST('1900-01-01' AS DATE) AS TIMESTAMP)) <= y",
+        )
+        self.validate_identity("SELECT DATE '2024-01-01' + 1", "SELECT CAST('2024-01-01' AS DATE) + 1")
+
     def test_bool_or(self):
         self.validate_identity(
             "SELECT a, LOGICAL_OR(b) FROM table GROUP BY a",

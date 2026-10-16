@@ -4942,11 +4942,15 @@ class Parser(metaclass=_Parser):
             this = self._parse_primary()
 
             if isinstance(this, exp.Literal):
+                # Postfix operators bind to the whole typed literal, e.g. PostgreSQL's
+                # DATE '2020-01-01'::VARCHAR casts the DATE value, not the string.
                 parser = self.TYPE_LITERAL_PARSERS.get(data_type.this)
                 if parser:
-                    return parser(self, this, data_type)
+                    return self._parse_column_ops(parser(self, this, data_type))
 
-                return self.expression(exp.Cast, this=this, to=data_type)
+                return self._parse_column_ops(
+                    self.expression(exp.Cast, this=this, to=data_type)
+                )
 
             # The expressions arg gets set by the parser when we have something like DECIMAL(38, 0)
             # in the input SQL. In that case, we'll produce these tokens: DECIMAL ( 38 , 0 )

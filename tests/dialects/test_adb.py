@@ -27,6 +27,16 @@ class TestADB(Validator):
             self.assertIsInstance(self.parse_one(f"{function}('20261015', 'YYYYMMDD')"), node)
         self.assertIsInstance(parse_one("TO_CHAR(v, 'YYYY')", read="postgres"), exp.TimeToStr)
 
+    def test_typed_literal_postfix_cast_to_doris(self):
+        self.validate_all(
+            "SELECT SUBSTR(DATE'2024-01-01'::VARCHAR, 1, 4)",
+            write={"doris": "SELECT SUBSTRING(CAST(CAST('2024-01-01' AS DATE) AS VARCHAR), 1, 4)"},
+        )
+        self.validate_all(
+            "SELECT COALESCE(x, DATE'1900-01-01'::TIMESTAMP(0))",
+            write={"doris": "SELECT COALESCE(x, CAST(CAST('1900-01-01' AS DATE) AS DATETIME(0)))"},
+        )
+
     def test_extrema_builtin_case_and_arity(self):
         for name, kind in (("GREATEST", exp.Greatest), ("LEAST", exp.Least)):
             for function in (name, name.lower(), name.title()):
